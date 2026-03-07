@@ -42,6 +42,10 @@ struct dev_context {
 	uint16_t dig_channel_masks[16];
 	uint64_t dig_samplerate;
 
+	const char *fpga_bitstream;
+	unsigned int unit_size; /* 1 for <=8ch, 2 for <=16ch */
+	gboolean is_fx2;
+
 	uint32_t lfsr;
 
 	unsigned int num_transfers;

@@ -22,9 +22,59 @@
 #include <string.h>
 #include "protocol.h"
 
-#define BUF_COUNT 512
-#define BUF_SIZE (16 * 1024)
-#define BUF_TIMEOUT 1000
+#define SALEAE_VID		0x21a9
+#define LOGIC_PRO_16_PID	0x1006
+#define LOGIC_8_PID		0x1004
+
+#define USB_CONFIGURATION	1
+#define BUF_COUNT		512
+#define BUF_SIZE		(16 * 1024)
+#define BUF_TIMEOUT		1000
+
+struct saleae_model_info {
+	uint16_t pid;
+	const char *manufacturer;
+	const char *product;
+	const char *model_name;
+	const char *fx_firmware;
+	const char *fpga_bitstream;
+	unsigned int num_channels;
+	unsigned int unit_size;
+	gboolean is_fx2;
+};
+
+static const struct saleae_model_info models[] = {
+	{
+		.pid = LOGIC_PRO_16_PID,
+		.manufacturer = "Saleae",
+		.product = "Logic Pro",
+		.model_name = "Logic Pro 16",
+		.fx_firmware = "saleae-logicpro16-fx3.fw",
+		.fpga_bitstream = "saleae-logicpro16-fpga.bitstream",
+		.num_channels = 16,
+		.unit_size = 2,
+		.is_fx2 = FALSE,
+	},
+	{
+		.pid = LOGIC_8_PID,
+		.manufacturer = "Saleae Inc",
+		.product = "Logic 8",
+		.model_name = "Logic 8",
+		.fx_firmware = "saleae-logic8-fx2.fw",
+		.fpga_bitstream = "saleae-logic8-fpga.bitstream",
+		.num_channels = 8,
+		.unit_size = 1,
+		.is_fx2 = TRUE,
+	},
+};
+
+static const struct saleae_model_info *find_model(uint16_t pid)
+{
+	for (unsigned int i = 0; i < ARRAY_SIZE(models); i++)
+		if (models[i].pid == pid)
+			return &models[i];
+	return NULL;
+}
 
 static const uint32_t scanopts[] = {
 	SR_CONF_CONN,
@@ -126,7 +176,8 @@ static int upload_firmware(struct sr_context *ctx, libusb_device *dev, const cha
 	return ret;
 }
 
-static gboolean scan_firmware(libusb_device *dev)
+static gboolean scan_firmware(libusb_device *dev,
+			      const struct saleae_model_info *model)
 {
 	struct libusb_device_descriptor des;
 	struct libusb_device_handle *hdl;
@@ -144,13 +195,13 @@ static gboolean scan_firmware(libusb_device *dev)
 	if (libusb_get_string_descriptor_ascii(hdl,
 		des.iManufacturer, strdesc, sizeof(strdesc)) < 0)
 		goto out;
-	if (strcmp((const char *)strdesc, "Saleae"))
+	if (strcmp((const char *)strdesc, model->manufacturer))
 		goto out;
 
 	if (libusb_get_string_descriptor_ascii(hdl,
 		des.iProduct, strdesc, sizeof(strdesc)) < 0)
 		goto out;
-	if (strcmp((const char *)strdesc, "Logic Pro"))
+	if (strcmp((const char *)strdesc, model->product))
 		goto out;
 
 	ret = TRUE;
@@ -171,6 +222,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 	libusb_device **devlist;
 	struct libusb_device_descriptor des;
 	const char *conn;
+	const struct saleae_model_info *model;
 	char connection_id[64];
 	gboolean fw_loaded = FALSE;
 
@@ -190,32 +242,47 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 		}
 	}
 
+	/* First pass: upload firmware to devices that need it. */
 	libusb_get_device_list(drvc->sr_ctx->libusb_ctx, &devlist);
 	for (unsigned int i = 0; devlist[i]; i++) {
 		libusb_get_device_descriptor(devlist[i], &des);
 
-		if (des.idVendor != 0x21a9 || des.idProduct != 0x1006)
+		if (des.idVendor != SALEAE_VID)
+			continue;
+		model = find_model(des.idProduct);
+		if (!model)
 			continue;
 
-		if (!scan_firmware(devlist[i])) {
-			const char *fwname;
-			sr_info("Found a Logic Pro 16 device (no firmware loaded).");
-			fwname = "saleae-logicpro16-fx3.fw";
-			if (upload_firmware(drvc->sr_ctx, devlist[i],
-					    fwname) != SR_OK) {
-				sr_err("Firmware upload failed, name %s.", fwname);
-				continue;
-			};
+		if (!scan_firmware(devlist[i], model)) {
+			sr_info("Found a %s device (no firmware loaded).",
+				model->model_name);
+			if (model->is_fx2) {
+				if (ezusb_upload_firmware(drvc->sr_ctx,
+						devlist[i], USB_CONFIGURATION,
+						model->fx_firmware) != SR_OK) {
+					sr_err("Firmware upload failed for %s.",
+					       model->model_name);
+					continue;
+				}
+			} else {
+				if (upload_firmware(drvc->sr_ctx, devlist[i],
+						   model->fx_firmware) != SR_OK) {
+					sr_err("Firmware upload failed for %s.",
+					       model->model_name);
+					continue;
+				}
+			}
 			fw_loaded = TRUE;
 		}
-
 	}
 	if (fw_loaded) {
-		/* Give the device some time to come back and scan again */
+		/* Give the device some time to come back and scan again. */
 		libusb_free_device_list(devlist, 1);
-		g_usleep(500 * 1000);
+		g_usleep(1500 * 1000);
 		libusb_get_device_list(drvc->sr_ctx->libusb_ctx, &devlist);
 	}
+
+	/* Second pass: create device instances. */
 	if (conn)
 		conn_devices = sr_usb_find(drvc->sr_ctx->libusb_ctx, conn);
 	for (unsigned int i = 0; devlist[i]; i++) {
@@ -230,14 +297,15 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 					break;
 			}
 			if (!l)
-				/* This device matched none of the ones that
-				 * matched the conn specification. */
 				continue;
 		}
 
 		libusb_get_device_descriptor(devlist[i], &des);
 
-		if (des.idVendor != 0x21a9 || des.idProduct != 0x1006)
+		if (des.idVendor != SALEAE_VID)
+			continue;
+		model = find_model(des.idProduct);
+		if (!model)
 			continue;
 
 		if (usb_get_port_path(devlist[i], connection_id, sizeof(connection_id)) < 0)
@@ -246,23 +314,25 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 		sdi = g_malloc0(sizeof(struct sr_dev_inst));
 		sdi->status = SR_ST_INITIALIZING;
 		sdi->vendor = g_strdup("Saleae");
-		sdi->model = g_strdup("Logic Pro 16");
+		sdi->model = g_strdup(model->model_name);
 		sdi->connection_id = g_strdup(connection_id);
 
-		for (unsigned int j = 0; j < ARRAY_SIZE(channel_names); j++)
+		for (unsigned int j = 0; j < model->num_channels; j++)
 			sr_channel_new(sdi, j, SR_CHANNEL_LOGIC, TRUE,
 				       channel_names[j]);
 
-		sr_dbg("Found a Logic Pro 16 device.");
+		sr_dbg("Found a %s device.", model->model_name);
 		sdi->status = SR_ST_INACTIVE;
 		sdi->inst_type = SR_INST_USB;
 		sdi->conn = sr_usb_dev_inst_new(libusb_get_bus_number(devlist[i]),
 						libusb_get_device_address(devlist[i]), NULL);
 
 		devc = g_malloc0(sizeof(struct dev_context));
+		devc->fpga_bitstream = model->fpga_bitstream;
+		devc->unit_size = model->unit_size;
+		devc->is_fx2 = model->is_fx2;
 		sdi->priv = devc;
 		devices = g_slist_append(devices, sdi);
-
 	}
 	g_slist_free_full(conn_devices, (GDestroyNotify)sr_usb_dev_inst_free);
 	libusb_free_device_list(devlist, 1);
@@ -459,7 +529,7 @@ static int dev_acquisition_stop(struct sr_dev_inst *sdi)
 
 static struct sr_dev_driver saleae_logic_pro_driver_info = {
 	.name = "saleae-logic-pro",
-	.longname = "Saleae Logic Pro",
+	.longname = "Saleae Logic Pro/Logic 8",
 	.api_version = 1,
 	.init = std_init,
 	.cleanup = std_cleanup,

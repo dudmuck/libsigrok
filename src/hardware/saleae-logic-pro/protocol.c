@@ -95,6 +95,7 @@ static int transact(const struct sr_dev_inst *sdi,
 		    const uint8_t *req, uint16_t req_len,
 		    uint8_t *rsp, uint16_t rsp_len)
 {
+	struct dev_context *devc = sdi->priv;
 	struct sr_usb_dev_inst *usb = sdi->conn;
 	uint8_t *req_enc;
 	uint8_t rsp_dummy[1] = {};
@@ -108,6 +109,7 @@ static int transact(const struct sr_dev_inst *sdi,
 	encrypt(sdi, req, req_enc, req_len);
 
 	ret = libusb_bulk_transfer(usb->devhdl, 1, req_enc, req_len, &xfer, 1000);
+	g_free(req_enc);
 	if (ret != 0) {
 		sr_dbg("Failed to send request 0x%02x: %s.",
 		       req[1], libusb_error_name(ret));
@@ -122,6 +124,12 @@ static int transact(const struct sr_dev_inst *sdi,
 	if (req[0] == 0x20) { /* Reseed. */
 		return SR_OK;
 	} else if (rsp_len == 0) {
+		/*
+		 * FX2 firmware does not send ack responses to write
+		 * commands, so skip the dummy read.
+		 */
+		if (devc->is_fx2)
+			return SR_OK;
 		rsp = rsp_dummy;
 		rsp_len = sizeof(rsp_dummy);
 	}
@@ -144,13 +152,34 @@ static int transact(const struct sr_dev_inst *sdi,
 	return SR_OK;
 }
 
+/*
+ * The FX2 firmware (Logic 8) initializes its LFSR to 0x354b248e
+ * and restores this value before decrypting a reseed command.
+ * The FX3 firmware (Logic Pro 16) starts at 0.
+ */
+#define LOGIC8_INITIAL_LFSR	0x354b248e
+
 static int reseed(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc = sdi->priv;
 	uint8_t req[] = {0x20, 0x24, 0x4b, 0x35, 0x8e};
+	int ret;
 
-	devc->lfsr = 0;
-	return transact(sdi, req, sizeof(req), NULL, 0);
+	devc->lfsr = devc->is_fx2 ? LOGIC8_INITIAL_LFSR : 0;
+	ret = transact(sdi, req, sizeof(req), NULL, 0);
+
+	if (ret == SR_OK && devc->is_fx2) {
+		/*
+		 * The FX2 firmware builds a new LFSR from the decoded
+		 * reseed payload (bytes 1-4), overriding the iterated
+		 * value. Match it on the host side.
+		 */
+		devc->lfsr = req[1] | ((uint32_t)req[2] << 8) |
+			     ((uint32_t)req[3] << 16) |
+			     ((uint32_t)req[4] << 24);
+	}
+
+	return ret;
 }
 
 static int write_regs(const struct sr_dev_inst *sdi, uint8_t (*regs)[2], uint8_t cnt)
@@ -220,14 +249,24 @@ static int write_adc(const struct sr_dev_inst *sdi,
 static int read_eeprom(const struct sr_dev_inst *sdi,
 		       uint16_t address, uint8_t *data, uint16_t len)
 {
-	uint8_t req[8] = {
-		0x00, COMMAND_READ_EEPROM,
-		0x33, 0x81, /* Unknown values */
-		address, address >> 8,
-		len, len >> 8
-	};
+	struct dev_context *devc = sdi->priv;
 
-	return transact(sdi, req, sizeof(req), data, len);
+	if (devc->is_fx2) {
+		uint8_t req[6] = {
+			0x00, COMMAND_READ_EEPROM,
+			0x33, 0x81,
+			address, len
+		};
+		return transact(sdi, req, sizeof(req), data, len);
+	} else {
+		uint8_t req[8] = {
+			0x00, COMMAND_READ_EEPROM,
+			0x33, 0x81,
+			address, address >> 8,
+			len, len >> 8
+		};
+		return transact(sdi, req, sizeof(req), data, len);
+	}
 }
 
 static int read_eeprom_serial(const struct sr_dev_inst *sdi,
@@ -244,8 +283,17 @@ static int read_eeprom_magic(const struct sr_dev_inst *sdi,
 
 static int read_temperature(const struct sr_dev_inst *sdi, int8_t *temp)
 {
+	struct dev_context *devc = sdi->priv;
 	uint8_t req[2] = {0x00, COMMAND_READ_TEMP};
+	uint8_t rsp[2];
+	int ret;
 
+	if (devc->is_fx2) {
+		ret = transact(sdi, req, sizeof(req), rsp, 2);
+		if (ret == SR_OK)
+			*temp = rsp[0];
+		return ret;
+	}
 	return transact(sdi, req, sizeof(req), (uint8_t*)temp, 1);
 }
 
@@ -464,25 +512,57 @@ static int authenticate(const struct sr_dev_inst *sdi)
 static int upload_bitstream_part(const struct sr_dev_inst *sdi,
 				 const uint8_t *data, uint16_t len)
 {
-	uint8_t req[4 + 1020];
-	uint8_t rsp[1];
-	int ret;
+	struct dev_context *devc = sdi->priv;
+	struct sr_usb_dev_inst *usb = sdi->conn;
+	int ret, xfer;
 
-	if (len < 1 || len > 1020 || !data)
+	if (!data)
 		return SR_ERR_ARG;
 
-	req[0] = 0x00;
-	req[1] = COMMAND_SEND_BITSTREAM;
-	req[2] = len;
-	req[3] = len >> 8;
-	memcpy(req + 4, data, len);
+	if (devc->is_fx2) {
+		/*
+		 * FX2 bitstream upload bypasses encryption: byte 0 has
+		 * bit 3 set to route through the unencrypted bitstream
+		 * path, byte 1 = 0x7f, byte 2 = length.
+		 */
+		uint8_t req[3 + 62];
 
-	ret = transact(sdi, req, 4 + len, rsp, sizeof(rsp));
-	if (ret != SR_OK)
-		return ret;
-	if (rsp[0] != 0x00) {
-		sr_dbg("Failed to do bitstream upload (0x%02x).", rsp[0]);
-		return SR_ERR;
+		if (len < 1 || len > 62)
+			return SR_ERR_ARG;
+
+		req[0] = 0x08;
+		req[1] = COMMAND_SEND_BITSTREAM;
+		req[2] = len;
+		memcpy(req + 3, data, len);
+
+		ret = libusb_bulk_transfer(usb->devhdl, 1,
+					   req, 3 + len, &xfer, 1000);
+		if (ret != 0) {
+			sr_dbg("Failed to send bitstream: %s.",
+			       libusb_error_name(ret));
+			return SR_ERR;
+		}
+	} else {
+		uint8_t req[4 + 1020];
+		uint8_t rsp[1];
+
+		if (len < 1 || len > 1020)
+			return SR_ERR_ARG;
+
+		req[0] = 0x00;
+		req[1] = COMMAND_SEND_BITSTREAM;
+		req[2] = len;
+		req[3] = len >> 8;
+		memcpy(req + 4, data, len);
+
+		ret = transact(sdi, req, 4 + len, rsp, sizeof(rsp));
+		if (ret != SR_OK)
+			return ret;
+		if (rsp[0] != 0x00) {
+			sr_dbg("Failed to do bitstream upload (0x%02x).",
+			       rsp[0]);
+			return SR_ERR;
+		}
 	}
 
 	return SR_OK;
@@ -491,13 +571,14 @@ static int upload_bitstream_part(const struct sr_dev_inst *sdi,
 static int upload_bitstream(const struct sr_dev_inst *sdi,
 			    const char *name)
 {
+	struct dev_context *devc = sdi->priv;
 	struct drv_context *drvc = sdi->driver->context;
 	unsigned char *bitstream = NULL;
 	uint8_t req[2];
 	uint8_t rsp[1];
 	uint8_t reg_val;
 	int ret = SR_ERR;
-	size_t bs_size, bs_offset = 0, bs_part_size;
+	size_t bs_size, bs_offset = 0, bs_part_size, bs_max_part;
 
 	bitstream = sr_resource_load(drvc->sr_ctx, SR_RESOURCE_FIRMWARE,
 				     name, &bs_size, 512 * 1024);
@@ -509,17 +590,41 @@ static int upload_bitstream(const struct sr_dev_inst *sdi,
 	req[0] = 0x00;
 	req[1] = COMMAND_INIT_BITSTREAM;
 
-	ret = transact(sdi, req, sizeof(req), rsp, sizeof(rsp));
+	if (devc->is_fx2) {
+		/*
+		 * FX2 firmware does not respond to INIT_BITSTREAM.
+		 * Send the encrypted command directly without reading.
+		 */
+		struct sr_usb_dev_inst *usb = sdi->conn;
+		uint8_t req_enc[2];
+		int xfer;
+
+		encrypt(sdi, req, req_enc, sizeof(req));
+		ret = libusb_bulk_transfer(usb->devhdl, 1,
+					   req_enc, sizeof(req_enc),
+					   &xfer, 1000);
+		if (ret != 0) {
+			sr_dbg("Failed to send INIT_BITSTREAM: %s.",
+			       libusb_error_name(ret));
+			ret = SR_ERR;
+			goto out;
+		}
+	} else {
+		ret = transact(sdi, req, sizeof(req), rsp, sizeof(rsp));
+		if (ret == SR_OK && rsp[0] != 0x00) {
+			sr_err("Failed to start bitstream upload (0x%02x).",
+			       rsp[0]);
+			ret = SR_ERR;
+			goto out;
+		}
+	}
 	if (ret != SR_OK)
 		return ret;
-	if (rsp[0] != 0x00) {
-		sr_err("Failed to start bitstream upload (0x%02x).", rsp[0]);
-		ret = SR_ERR;
-		goto out;
-	}
+
+	bs_max_part = devc->is_fx2 ? 62 : 1020;
 
 	while (bs_offset < bs_size) {
-		bs_part_size = MIN(bs_size - bs_offset, 1020);
+		bs_part_size = MIN(bs_size - bs_offset, bs_max_part);
 		sr_spew("Uploading %zd bytes.", bs_part_size);
 		ret = upload_bitstream_part(sdi, bitstream + bs_offset, bs_part_size);
 		if (ret != SR_OK)
@@ -527,7 +632,18 @@ static int upload_bitstream(const struct sr_dev_inst *sdi,
 		bs_offset += bs_part_size;
 	}
 
-	sr_info("Bitstream upload done.");
+	sr_info("Bitstream upload done (%zd bytes).", bs_size);
+
+	if (devc->is_fx2) {
+		/*
+		 * Send trailing 0xFF bytes to provide extra SCK edges
+		 * needed for ECP5 configuration completion.
+		 */
+		uint8_t trailer[62];
+		memset(trailer, 0xff, sizeof(trailer));
+		upload_bitstream_part(sdi, trailer, sizeof(trailer));
+		g_usleep(100000);
+	}
 
 	/* Check a scratch register? */
 	ret = write_reg(sdi, 0x7f, 0xaa);
@@ -537,7 +653,7 @@ static int upload_bitstream(const struct sr_dev_inst *sdi,
 	if (ret != SR_OK)
 		goto out;
 	if (reg_val != 0xaa) {
-		sr_err("Failed FPGA register read-back (0x%02x != 0xaa).", rsp[0]);
+		sr_err("Failed FPGA register read-back (0x%02x != 0xaa).", reg_val);
 		ret = SR_ERR;
 		goto out;
 	}
@@ -590,6 +706,8 @@ static int configure_channels(const struct sr_dev_inst *sdi)
 
 SR_PRIV int saleae_logic_pro_init(const struct sr_dev_inst *sdi)
 {
+	struct dev_context *devc = sdi->priv;
+	struct sr_usb_dev_inst *usb = sdi->conn;
 	uint8_t reg_val;
 	uint8_t dummy[8];
 	uint8_t serial[8];
@@ -597,13 +715,25 @@ SR_PRIV int saleae_logic_pro_init(const struct sr_dev_inst *sdi)
 	int8_t temperature;
 	int ret, i;
 
+	/* Logic 8 (FX2) needs endpoint halt cleared before communication. */
+	if (devc->is_fx2) {
+		libusb_clear_halt(usb->devhdl, 0x01);
+		libusb_clear_halt(usb->devhdl, 0x81);
+		libusb_clear_halt(usb->devhdl, 0x82);
+	}
+
 	ret = reseed(sdi);
 	if (ret != SR_OK)
 		return ret;
 
-	ret = get_firmware_version(sdi);
-	if (ret != SR_OK)
-		return ret;
+	/*
+	 * Logic 8 firmware does not support COMMAND_READ_FW_VER (0x8b).
+	 */
+	if (!devc->is_fx2) {
+		ret = get_firmware_version(sdi);
+		if (ret != SR_OK)
+			return ret;
+	}
 
 	sr_dbg("read serial");
 	ret = read_eeprom_serial(sdi, serial);
@@ -611,13 +741,21 @@ SR_PRIV int saleae_logic_pro_init(const struct sr_dev_inst *sdi)
 		return ret;
 
 	/* Check if we need to upload the bitstream. */
-	ret = read_reg(sdi, 0x7f, &reg_val);
-	if (ret != SR_OK)
-		return ret;
+	if (devc->is_fx2) {
+		/*
+		 * FX2: Always upload bitstream. Attempting to read
+		 * from an unconfigured FPGA may cause issues.
+		 */
+		reg_val = 0x00;
+	} else {
+		ret = read_reg(sdi, 0x7f, &reg_val);
+		if (ret != SR_OK)
+			return ret;
+	}
 	if (reg_val == 0xaa) {
 		sr_info("Skipping bitstream upload.");
 	} else {
-		ret = upload_bitstream(sdi, "saleae-logicpro16-fpga.bitstream");
+		ret = upload_bitstream(sdi, devc->fpga_bitstream);
 		if (ret != SR_OK)
 			return ret;
 	}
@@ -724,6 +862,7 @@ SR_PRIV int saleae_logic_pro_init(const struct sr_dev_inst *sdi)
 SR_PRIV int saleae_logic_pro_prepare(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc = sdi->priv;
+	struct sr_usb_dev_inst *usb = sdi->conn;
 	uint8_t regs_unknown[][2] = {
 		{0x03, 0x0f},
 		{0x04, 0x00},
@@ -780,13 +919,30 @@ SR_PRIV int saleae_logic_pro_prepare(const struct sr_dev_inst *sdi)
 		return SR_ERR_ARG;
 	}
 
-	authenticate(sdi);
+	/*
+	 * Logic 8 (FX2) does not have the ATECC crypto chip, so skip
+	 * authentication. The START_CAPTURE command also has no response
+	 * on FX2.
+	 */
+	if (!devc->is_fx2)
+		authenticate(sdi);
 
 	write_reg(sdi, 0x15, 0x03);
 	write_regs(sdi, ARRAY_AND_SIZE(regs_unknown));
 	write_regs(sdi, ARRAY_AND_SIZE(regs_config));
 
-	transact(sdi, start_req, sizeof(start_req), start_rsp, sizeof(start_rsp));
+	if (devc->is_fx2) {
+		uint8_t start_enc[2];
+		int xfer;
+
+		encrypt(sdi, start_req, start_enc, sizeof(start_req));
+		libusb_bulk_transfer(usb->devhdl, 1,
+				     start_enc, sizeof(start_enc),
+				     &xfer, 1000);
+	} else {
+		transact(sdi, start_req, sizeof(start_req),
+			 start_rsp, sizeof(start_rsp));
+	}
 
 	return SR_OK;
 }
@@ -805,18 +961,36 @@ SR_PRIV int saleae_logic_pro_start(const struct sr_dev_inst *sdi)
 
 SR_PRIV int saleae_logic_pro_stop(const struct sr_dev_inst *sdi)
 {
+	struct dev_context *devc = sdi->priv;
+	struct sr_usb_dev_inst *usb = sdi->conn;
 	uint8_t stop_req[] = {0x00, 0x02};
 	uint8_t stop_rsp[2] = {};
 	uint8_t status;
 	int ret;
 
 	write_reg(sdi, 0x00, 0x00);
-	transact(sdi, stop_req, sizeof(stop_req), stop_rsp, sizeof(stop_rsp));
+
+	if (devc->is_fx2) {
+		uint8_t stop_enc[2];
+		int xfer;
+
+		encrypt(sdi, stop_req, stop_enc, sizeof(stop_req));
+		libusb_bulk_transfer(usb->devhdl, 1,
+				     stop_enc, sizeof(stop_enc),
+				     &xfer, 1000);
+	} else {
+		transact(sdi, stop_req, sizeof(stop_req),
+			 stop_rsp, sizeof(stop_rsp));
+	}
 
 	ret = read_reg(sdi, 0x40, &status);
 	if (ret != SR_OK)
 		return ret;
-	if (status != 0x20) {
+	/*
+	 * FX2 returns 0xa0 on normal stop (bit 7 always set),
+	 * while FX3 returns 0x20.
+	 */
+	if ((status & 0x60) != 0x20) {
 		sr_err("Capture error (status reg = 0x%02x).", status);
 		return SR_ERR;
 	}
@@ -904,7 +1078,20 @@ SR_PRIV void LIBUSB_CALL saleae_logic_pro_receive_data(struct libusb_transfer *t
 	}
 
 	saleae_logic_pro_convert_data(sdi, (uint32_t*)transfer->buffer, 16 * 1024 / 4);
-	saleae_logic_pro_send_data(sdi, devc->conv_buffer, devc->conv_size, 2);
+
+	if (devc->unit_size == 1) {
+		/* Pack 16-bit samples to 8-bit for 8-channel devices. */
+		uint16_t *src = (uint16_t *)devc->conv_buffer;
+		uint8_t *dst = devc->conv_buffer;
+		unsigned int nsamples = devc->conv_size / 2;
+		unsigned int i;
+		for (i = 0; i < nsamples; i++)
+			dst[i] = src[i] & 0xff;
+		saleae_logic_pro_send_data(sdi, devc->conv_buffer, nsamples, 1);
+	} else {
+		saleae_logic_pro_send_data(sdi, devc->conv_buffer,
+					   devc->conv_size, 2);
+	}
 
 	if ((ret = libusb_submit_transfer(transfer)) != LIBUSB_SUCCESS)
 		sr_dbg("FIXME resubmit failed");
