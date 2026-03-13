@@ -1590,7 +1590,7 @@ static void saleae_logic_pro_convert_fx2_frame(struct dev_context *devc,
 	unsigned int ch, s;
 
 	for (ch = 0; ch < devc->dig_channel_cnt; ch++)
-		ch_words[ch] = (frame[ch * 2] << 8) | frame[ch * 2 + 1];
+		ch_words[ch] = frame[ch * 2] | (frame[ch * 2 + 1] << 8);
 
 	for (s = 0; s < FX2_SAMPLES_PER_FRAME; s++) {
 		uint8_t sample = 0;
