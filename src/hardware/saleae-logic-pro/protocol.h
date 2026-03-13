@@ -55,6 +55,10 @@ struct dev_context {
 	uint8_t *conv_buffer;
 	unsigned int conv_size;
 	unsigned int batch_index;
+
+	/* FX2: partial frame carried across USB transfers. */
+	uint8_t fx2_partial[16]; /* max frame = 8 channels × 2 bytes */
+	unsigned int fx2_partial_len;
 };
 
 SR_PRIV int saleae_logic_pro_init(const struct sr_dev_inst *sdi);

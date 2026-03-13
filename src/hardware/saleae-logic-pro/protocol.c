@@ -57,7 +57,6 @@ static void iterate_lfsr(const struct sr_dev_inst *sdi)
 			  (lfsr >> 31)		\
 			  ) << 31);
 	}
-	sr_spew("Iterate 0x%08x -> 0x%08x", devc->lfsr, lfsr);
 	devc->lfsr = lfsr;
 }
 
@@ -180,6 +179,24 @@ static int reseed(const struct sr_dev_inst *sdi)
 	}
 
 	return ret;
+}
+
+/*
+ * CMD(0x7d): Check FPGA status. Returns 0xaa when FPGA is configured.
+ * Logic 2 sends this after each reseed on the FX2 with byte 2 = 0x55.
+ */
+static int check_fpga_status(const struct sr_dev_inst *sdi)
+{
+	uint8_t req[3] = {0x00, 0x7d, 0x55};
+	uint8_t rsp[1];
+	int ret;
+
+	ret = transact(sdi, req, sizeof(req), rsp, sizeof(rsp));
+	if (ret != SR_OK)
+		return ret;
+
+	sr_dbg("FPGA status (cmd 0x7d) = 0x%02x", rsp[0]);
+	return SR_OK;
 }
 
 static int write_regs(const struct sr_dev_inst *sdi, uint8_t (*regs)[2], uint8_t cnt)
@@ -636,19 +653,21 @@ static int upload_bitstream(const struct sr_dev_inst *sdi,
 
 	if (devc->is_fx2) {
 		/*
-		 * Send trailing 0xFF bytes to provide extra SCK edges
-		 * needed for ECP5 configuration completion.
+		 * Wait for ECP5 to complete configuration activation.
+		 * No trailer needed - USB capture shows none.
 		 */
-		uint8_t trailer[62];
-		memset(trailer, 0xff, sizeof(trailer));
-		upload_bitstream_part(sdi, trailer, sizeof(trailer));
 		g_usleep(100000);
 	}
 
-	/* Check a scratch register? */
+	/* Write 0x7f=0xaa twice as Logic 2 does. */
 	ret = write_reg(sdi, 0x7f, 0xaa);
 	if (ret != SR_OK)
 		goto out;
+	if (devc->is_fx2) {
+		ret = write_reg(sdi, 0x7f, 0xaa);
+		if (ret != SR_OK)
+			goto out;
+	}
 	ret = read_reg(sdi, 0x7f, &reg_val);
 	if (ret != SR_OK)
 		goto out;
@@ -704,6 +723,360 @@ static int configure_channels(const struct sr_dev_inst *sdi)
 	return SR_OK;
 }
 
+/*
+ * Poll an FPGA register until (value & mask) is nonzero, with timeout.
+ */
+static int poll_reg(const struct sr_dev_inst *sdi,
+		    uint8_t addr, uint8_t mask, unsigned int timeout_ms)
+{
+	uint8_t val;
+	unsigned int elapsed = 0;
+	int ret;
+
+	while (elapsed < timeout_ms) {
+		ret = read_reg(sdi, addr, &val);
+		if (ret != SR_OK)
+			return ret;
+		if (val & mask)
+			return SR_OK;
+		g_usleep(1000);
+		elapsed++;
+	}
+	sr_err("Timeout polling register 0x%02x (mask 0x%02x).", addr, mask);
+	return SR_ERR;
+}
+
+/*
+ * Configure the clock generator on Logic 8 via the FPGA's I2C master
+ * controller (registers 0x1c-0x30). This sequence was captured from the
+ * Saleae Logic 2 software at 25 MSps.
+ *
+ * The I2C master protocol uses:
+ *   0x1c: control (0x00=idle, 0x01=start, 0x02=write trigger)
+ *   0x1d: I2C device address
+ *   0x1e: byte count / register address
+ *   0x1f-0x2e: data buffer
+ *   0x2f: status (0x02=write done, 0x01=read done, 0x04=reset done)
+ *   0x30: response byte
+ */
+static int configure_clocks(const struct sr_dev_inst *sdi)
+{
+	int ret, i;
+	uint8_t dummy[16];
+
+	/*
+	 * Phase 1: Configure 6 PLL output channels.
+	 * Each channel: I2C write to device 0x77, read back from 0x88,
+	 * then I2C bus reset.
+	 */
+	static const uint8_t chan_data[][2] = {
+		{0x09, 0xa4}, /* Channel 0 */
+		{0x0a, 0x27}, /* Channel 1 */
+		{0x8a, 0x25}, /* Channel 2 */
+		{0x89, 0xa6}, /* Channel 3 */
+		{0xca, 0x24}, /* Channel 4 */
+		{0xc9, 0xa7}, /* Channel 5 */
+	};
+
+	sr_dbg("Configuring clocks (PLL)...");
+
+	for (i = 0; i < 6; i++) {
+		/* I2C write: device 0x77, 7 data bytes */
+		uint8_t wr[] = {
+			0x1d, 0x77, 0x1e, 0x07, 0x1c, 0x00,
+			0x1f, 0x07, 0x20, 0x02, 0x21, 0x82,
+			0x22, 0x40, 0x23, i,
+			0x24, chan_data[i][0], 0x25, chan_data[i][1],
+			0x1c, 0x00, 0x1c, 0x02,
+			0x1c, 0x00, 0x1c, 0x01, 0x1c, 0x00,
+		};
+		ret = write_regs(sdi, (uint8_t(*)[2])wr, 15);
+		if (ret != SR_OK) return ret;
+
+		ret = poll_reg(sdi, 0x2f, 0x02, 500);
+		if (ret != SR_OK) return ret;
+
+		/* I2C read: device 0x88, 0x23 bytes */
+		uint8_t rd[] = {
+			0x1d, 0x88, 0x1e, 0x23,
+			0x1c, 0x00, 0x1c, 0x01, 0x1c, 0x00,
+		};
+		ret = write_regs(sdi, (uint8_t(*)[2])rd, 5);
+		if (ret != SR_OK) return ret;
+
+		ret = poll_reg(sdi, 0x2f, 0x01, 500);
+		if (ret != SR_OK) return ret;
+
+		/* Read status and data (required for I2C timing) */
+		read_reg(sdi, 0x30, dummy);
+		read_regs(sdi, (uint8_t[]){0x1f,0x20,0x21,0x22,0x23,0x24,
+			0x25,0x26,0x27,0x28,0x29,0x2a,0x2b,0x2c,0x2d,0x2e},
+			dummy, 16);
+
+		/* Page 1 read */
+		uint8_t pg1[] = {0x1c, 0x10, 0x1c, 0x14, 0x1c, 0x10};
+		ret = write_regs(sdi, (uint8_t(*)[2])pg1, 3);
+		if (ret != SR_OK) return ret;
+		read_regs(sdi, (uint8_t[]){0x1f,0x20,0x21,0x22,0x23,0x24,
+			0x25,0x26,0x27,0x28,0x29,0x2a,0x2b,0x2c,0x2d,0x2e},
+			dummy, 16);
+
+		/* Page 2 read */
+		uint8_t pg2[] = {0x1c, 0x20, 0x1c, 0x24, 0x1c, 0x20};
+		ret = write_regs(sdi, (uint8_t(*)[2])pg2, 3);
+		if (ret != SR_OK) return ret;
+		read_regs(sdi, (uint8_t[]){0x1f,0x20,0x21}, dummy, 3);
+
+		/* I2C bus reset */
+		uint8_t rst[] = {
+			0x1d, 0xbb, 0x1e, 0x00,
+			0x1c, 0x00, 0x1c, 0x01, 0x1c, 0x00,
+		};
+		ret = write_regs(sdi, (uint8_t(*)[2])rst, 5);
+		if (ret != SR_OK) return ret;
+
+		ret = poll_reg(sdi, 0x2f, 0x04, 500);
+		if (ret != SR_OK) return ret;
+	}
+
+	/*
+	 * Phase 2: Reseed, check FPGA, send clock config 0x7b, reseed again.
+	 */
+	sr_dbg("Sending clock config command...");
+	ret = reseed(sdi);
+	if (ret != SR_OK) return ret;
+
+	check_fpga_status(sdi);
+
+	{
+		uint8_t cmd7b[] = {0x00, 0x7b, 0x01, 0xb8, 0xc2,
+				   0x00, 0xff, 0x00, 0x0f, 0x00};
+		ret = transact(sdi, cmd7b, sizeof(cmd7b), NULL, 0);
+		if (ret != SR_OK) return ret;
+	}
+
+	ret = reseed(sdi);
+	if (ret != SR_OK) return ret;
+
+	check_fpga_status(sdi);
+
+	/*
+	 * Phase 3: Additional I2C configuration.
+	 * Large write to device 0x0a, then authentication write to 0x27,
+	 * then final PLL config write to device 0x07.
+	 */
+	sr_dbg("Configuring PLL phase 3...");
+
+	/* I2C write to device 0x77, 0x0a data bytes */
+	{
+		uint8_t wr3a[][2] = {
+			{0x1d, 0x77}, {0x1e, 0x0a}, {0x1c, 0x00},
+			{0x1f, 0x0a}, {0x20, 0x40}, {0x21, 0x00},
+			{0x22, 0x00}, {0x23, 0x00}, {0x24, 0x00},
+			{0x25, 0x00}, {0x26, 0x00}, {0x27, 0xdd},
+			{0x28, 0x83},
+			{0x1c, 0x00}, {0x1c, 0x02},
+			{0x1c, 0x00}, {0x1c, 0x01}, {0x1c, 0x00},
+		};
+		ret = write_regs(sdi, wr3a, ARRAY_SIZE(wr3a));
+		if (ret != SR_OK) return ret;
+	}
+	ret = poll_reg(sdi, 0x2f, 0x02, 500);
+	if (ret != SR_OK) return ret;
+
+	/* I2C read from 0x88, addr 0x43 */
+	{
+		uint8_t rd3a[] = {
+			0x1d, 0x88, 0x1e, 0x43,
+			0x1c, 0x00, 0x1c, 0x01, 0x1c, 0x00,
+		};
+		ret = write_regs(sdi, (uint8_t(*)[2])rd3a, 5);
+		if (ret != SR_OK) return ret;
+	}
+	ret = poll_reg(sdi, 0x2f, 0x01, 2000);
+	if (ret != SR_OK) return ret;
+
+	/* Read status + 5 pages of I2C response data (required for timing). */
+	{
+		uint8_t pg3_status;
+		uint8_t pg3_data[16];
+
+		read_reg(sdi, 0x30, &pg3_status);
+		read_regs(sdi, (uint8_t[]){0x1f,0x20,0x21,0x22,0x23,0x24,
+			0x25,0x26,0x27,0x28,0x29,0x2a,0x2b,0x2c,0x2d,0x2e},
+			pg3_data, 16);
+
+		{
+			uint8_t pg[][2] = {{0x1c, 0x10}, {0x1c, 0x14}, {0x1c, 0x10}};
+			write_regs(sdi, pg, 3);
+		}
+		read_regs(sdi, (uint8_t[]){0x1f,0x20,0x21,0x22,0x23,0x24,
+			0x25,0x26,0x27,0x28,0x29,0x2a,0x2b,0x2c,0x2d,0x2e},
+			pg3_data, 16);
+
+		{
+			uint8_t pg[][2] = {{0x1c, 0x20}, {0x1c, 0x24}, {0x1c, 0x20}};
+			write_regs(sdi, pg, 3);
+		}
+		read_regs(sdi, (uint8_t[]){0x1f,0x20,0x21}, pg3_data, 3);
+	}
+
+	/* I2C bus reset */
+	{
+		uint8_t rst[][2] = {
+			{0x1d, 0xbb}, {0x1e, 0x00},
+			{0x1c, 0x00}, {0x1c, 0x01}, {0x1c, 0x00},
+		};
+		ret = write_regs(sdi, rst, 5);
+		if (ret != SR_OK) return ret;
+	}
+	ret = poll_reg(sdi, 0x2f, 0x04, 500);
+	if (ret != SR_OK) return ret;
+
+	/*
+	 * Large I2C write to device 0x77, 0x27 data bytes.
+	 * Must be split across multiple write_regs calls (max 30 regs).
+	 */
+	{
+		uint8_t wr3b[][2] = {
+			{0x1d, 0x77}, {0x1e, 0x27}, {0x1c, 0x00},
+			{0x1f, 0x27}, {0x20, 0x16}, {0x21, 0x03},
+			{0x22, 0x00}, {0x23, 0x00}, {0x24, 0x40},
+			{0x25, 0x66}, {0x26, 0xa7}, {0x27, 0x6f},
+			{0x28, 0x7e}, {0x29, 0x93}, {0x2a, 0x51},
+			{0x2b, 0x80}, {0x2c, 0x07}, {0x2d, 0xe1},
+			{0x2e, 0xbb},
+			{0x1c, 0x00}, {0x1c, 0x02}, {0x1c, 0x00},
+		};
+		ret = write_regs(sdi, wr3b, ARRAY_SIZE(wr3b));
+		if (ret != SR_OK) return ret;
+	}
+	{
+		uint8_t wr3c[][2] = {
+			{0x1f, 0xe5}, {0x20, 0x96}, {0x21, 0xa5},
+			{0x22, 0xf5}, {0x23, 0x4c}, {0x24, 0x84},
+			{0x25, 0x32}, {0x26, 0x34}, {0x27, 0x79},
+			{0x28, 0x22}, {0x29, 0xb6}, {0x2a, 0x75},
+			{0x2b, 0xfc}, {0x2c, 0x51}, {0x2d, 0x37},
+			{0x2e, 0x89},
+			{0x1c, 0x10}, {0x1c, 0x12}, {0x1c, 0x10},
+		};
+		ret = write_regs(sdi, wr3c, ARRAY_SIZE(wr3c));
+		if (ret != SR_OK) return ret;
+	}
+	{
+		uint8_t wr3d[][2] = {
+			{0x1f, 0x02}, {0x20, 0x8e}, {0x21, 0x3e},
+			{0x22, 0x9c}, {0x23, 0x4f}, {0x24, 0x0d},
+			{0x25, 0x65},
+			{0x1c, 0x20}, {0x1c, 0x22}, {0x1c, 0x20},
+			{0x1c, 0x21}, {0x1c, 0x20},
+		};
+		ret = write_regs(sdi, wr3d, ARRAY_SIZE(wr3d));
+		if (ret != SR_OK) return ret;
+	}
+	ret = poll_reg(sdi, 0x2f, 0x02, 500);
+	if (ret != SR_OK) return ret;
+
+	/* I2C read from 0x88, addr 0x04 */
+	{
+		uint8_t rd3b[] = {
+			0x1d, 0x88, 0x1e, 0x04,
+			0x1c, 0x00, 0x1c, 0x01, 0x1c, 0x00,
+		};
+		ret = write_regs(sdi, (uint8_t(*)[2])rd3b, 5);
+		if (ret != SR_OK) return ret;
+	}
+	ret = poll_reg(sdi, 0x2f, 0x01, 500);
+	if (ret != SR_OK) return ret;
+	{
+		uint8_t pg3b_status;
+		uint8_t pg3b_data[4];
+		read_reg(sdi, 0x30, &pg3b_status);
+		read_regs(sdi, (uint8_t[]){0x1f,0x20,0x21,0x22}, pg3b_data, 4);
+	}
+
+	/* I2C bus reset */
+	{
+		uint8_t rst[][2] = {
+			{0x1d, 0xbb}, {0x1e, 0x00},
+			{0x1c, 0x00}, {0x1c, 0x01}, {0x1c, 0x00},
+		};
+		ret = write_regs(sdi, rst, 5);
+		if (ret != SR_OK) return ret;
+	}
+	ret = poll_reg(sdi, 0x2f, 0x04, 500);
+	if (ret != SR_OK) return ret;
+
+	/* Final PLL config: I2C write to device 0x77, 7 data bytes */
+	{
+		uint8_t wr3e[][2] = {
+			{0x1d, 0x77}, {0x1e, 0x07}, {0x1c, 0x00},
+			{0x1f, 0x07}, {0x20, 0x41}, {0x21, 0x80},
+			{0x22, 0x00}, {0x23, 0x00}, {0x24, 0x28},
+			{0x25, 0x05},
+			{0x1c, 0x00}, {0x1c, 0x02},
+			{0x1c, 0x00}, {0x1c, 0x01}, {0x1c, 0x00},
+		};
+		ret = write_regs(sdi, wr3e, ARRAY_SIZE(wr3e));
+		if (ret != SR_OK) return ret;
+	}
+	ret = poll_reg(sdi, 0x2f, 0x02, 500);
+	if (ret != SR_OK) return ret;
+
+	/* I2C read from 0x88, addr 0x43 */
+	{
+		uint8_t rd3c[] = {
+			0x1d, 0x88, 0x1e, 0x43,
+			0x1c, 0x00, 0x1c, 0x01, 0x1c, 0x00,
+		};
+		ret = write_regs(sdi, (uint8_t(*)[2])rd3c, 5);
+		if (ret != SR_OK) return ret;
+	}
+	ret = poll_reg(sdi, 0x2f, 0x01, 2000);
+	if (ret != SR_OK) return ret;
+
+	/* Read status + 5 pages of I2C response data (required for timing). */
+	{
+		uint8_t pg3_status;
+		uint8_t pg3_data[16];
+
+		read_reg(sdi, 0x30, &pg3_status);
+		read_regs(sdi, (uint8_t[]){0x1f,0x20,0x21,0x22,0x23,0x24,
+			0x25,0x26,0x27,0x28,0x29,0x2a,0x2b,0x2c,0x2d,0x2e},
+			pg3_data, 16);
+
+		{
+			uint8_t pg[][2] = {{0x1c, 0x10}, {0x1c, 0x14}, {0x1c, 0x10}};
+			write_regs(sdi, pg, 3);
+		}
+		read_regs(sdi, (uint8_t[]){0x1f,0x20,0x21,0x22,0x23,0x24,
+			0x25,0x26,0x27,0x28,0x29,0x2a,0x2b,0x2c,0x2d,0x2e},
+			pg3_data, 16);
+
+		{
+			uint8_t pg[][2] = {{0x1c, 0x20}, {0x1c, 0x24}, {0x1c, 0x20}};
+			write_regs(sdi, pg, 3);
+		}
+		read_regs(sdi, (uint8_t[]){0x1f,0x20,0x21}, pg3_data, 3);
+	}
+
+	/* Final I2C bus reset */
+	{
+		uint8_t rst[][2] = {
+			{0x1d, 0xbb}, {0x1e, 0x00},
+			{0x1c, 0x00}, {0x1c, 0x01}, {0x1c, 0x00},
+		};
+		ret = write_regs(sdi, rst, 5);
+		if (ret != SR_OK) return ret;
+	}
+	ret = poll_reg(sdi, 0x2f, 0x04, 500);
+	if (ret != SR_OK) return ret;
+
+	sr_dbg("Clock configuration complete.");
+	return SR_OK;
+}
+
 SR_PRIV int saleae_logic_pro_init(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc = sdi->priv;
@@ -726,6 +1099,11 @@ SR_PRIV int saleae_logic_pro_init(const struct sr_dev_inst *sdi)
 	if (ret != SR_OK)
 		return ret;
 
+	if (devc->is_fx2) {
+		/* Logic 2 sends CMD(0x7d) after each reseed. */
+		check_fpga_status(sdi);
+	}
+
 	/*
 	 * Logic 8 firmware does not support COMMAND_READ_FW_VER (0x8b).
 	 */
@@ -741,117 +1119,184 @@ SR_PRIV int saleae_logic_pro_init(const struct sr_dev_inst *sdi)
 		return ret;
 
 	/* Check if we need to upload the bitstream. */
-	if (devc->is_fx2) {
-		/*
-		 * FX2: Always upload bitstream. Attempting to read
-		 * from an unconfigured FPGA may cause issues.
-		 */
-		reg_val = 0x00;
-	} else {
-		ret = read_reg(sdi, 0x7f, &reg_val);
-		if (ret != SR_OK)
+	ret = read_reg(sdi, 0x7f, &reg_val);
+	if (ret != SR_OK) {
+		if (devc->is_fx2) {
+			/* FX2: read may fail if FPGA unconfigured. */
+			reg_val = 0x00;
+		} else {
 			return ret;
+		}
 	}
+	sr_dbg("FPGA config register 0x7f = 0x%02x", reg_val);
 	if (reg_val == 0xaa) {
 		sr_info("Skipping bitstream upload.");
+		if (devc->is_fx2) {
+			/*
+			 * Replicate the tail of upload_bitstream:
+			 * write 0x7f=0xaa to signal configuration complete.
+			 */
+			write_reg(sdi, 0x7f, 0xaa);
+			write_reg(sdi, 0x7f, 0xaa);
+		}
 	} else {
 		ret = upload_bitstream(sdi, devc->fpga_bitstream);
 		if (ret != SR_OK)
 			return ret;
 	}
 
-	/* Reset the ADC? */
-	sr_dbg("reset ADC");
-	ret = write_reg(sdi, 0x00, 0x00);
-	if (ret != SR_OK)
-		return ret;
-	ret = write_reg(sdi, 0x00, 0x80);
-	if (ret != SR_OK)
-		return ret;
+	if (devc->is_fx2) {
+		/*
+		 * Logic 8 FPGA register init sequence from Logic 2 capture.
+		 * Registers 0x03/0x04/0x05 (ADC_IDX/VAL) configure the
+		 * FPGA's digital input data path routing. Without these
+		 * writes, the FPGA outputs an internal test signal.
+		 */
+		sr_dbg("FPGA input path config");
+		ret = write_adc(sdi, 0x00, 0x0001);
+		if (ret != SR_OK) return ret;
+		ret = write_adc(sdi, 0x0f, 0x0000);
+		if (ret != SR_OK) return ret;
+		ret = write_adc(sdi, 0x11, 0x0777);
+		if (ret != SR_OK) return ret;
+		ret = write_adc(sdi, 0x12, 0x4444);
+		if (ret != SR_OK) return ret;
+		ret = write_adc(sdi, 0x2a, 0x1111);
+		if (ret != SR_OK) return ret;
+		ret = write_adc(sdi, 0x2b, 0x1111);
+		if (ret != SR_OK) return ret;
+		ret = write_adc(sdi, 0x42, 0x8040);
+		if (ret != SR_OK) return ret;
+		ret = write_adc(sdi, 0x46, 0x8204);
+		if (ret != SR_OK) return ret;
 
-	sr_dbg("init ADC");
-	ret = write_adc(sdi, 0x11, 0x0444);
-	if (ret != SR_OK)
-		return ret;
-	ret = write_adc(sdi, 0x12, 0x0777);
-	if (ret != SR_OK)
-		return ret;
-	ret = write_adc(sdi, 0x25, 0x0000);
-	if (ret != SR_OK)
-		return ret;
-	ret = write_adc(sdi, 0x45, 0x0000);
-	if (ret != SR_OK)
-		return ret;
-	ret = write_adc(sdi, 0x2a, 0x1111);
-	if (ret != SR_OK)
-		return ret;
-	ret = write_adc(sdi, 0x2b, 0x1111);
-	if (ret != SR_OK)
-		return ret;
-	ret = write_adc(sdi, 0x46, 0x0004);
-	if (ret != SR_OK)
-		return ret;
-	ret = write_adc(sdi, 0x50, 0x0000);
-	if (ret != SR_OK)
-		return ret;
-	ret = write_adc(sdi, 0x55, 0x0020);
-	if (ret != SR_OK)
-		return ret;
-	ret = write_adc(sdi, 0x56, 0x0000);
-	if (ret != SR_OK)
-		return ret;
+		/*
+		 * FX2 reset sequence from USB capture:
+		 * ADC reset (bit 2), wait for PLL lock, then
+		 * SERDES reset (bit 3).
+		 */
+		sr_dbg("FX2: ADC reset");
+		write_reg(sdi, 0x00, 0x04);
+		write_reg(sdi, 0x00, 0x00);
 
-	ret = write_reg(sdi, 0x15, 0x00);
-	if (ret != SR_OK)
-		return ret;
+		/* Poll for PLL lock: bits 7+5 of register 0x40. */
+		{
+			uint8_t status;
+			int i;
+			for (i = 0; i < 2000; i++) {
+				read_reg(sdi, 0x40, &status);
+				if ((status & 0xa0) == 0xa0)
+					break;
+				g_usleep(1000);
+			}
+			sr_dbg("PLL lock: 0x40=0x%02x after %d polls",
+			       status, i);
+		}
 
-	ret = write_adc(sdi, 0x0f, 0x0100);
-	if (ret != SR_OK)
-		return ret;
+		/* SERDES reset. */
+		sr_dbg("FX2: SERDES reset");
+		write_reg(sdi, 0x00, 0x08);
+		write_reg(sdi, 0x00, 0x00);
 
-	/* Resets? */
-	sr_dbg("resets");
-	ret = write_reg(sdi, 0x00, 0x02); /* bit 1 */
-	if (ret != SR_OK)
-		return ret;
-	ret = write_reg(sdi, 0x00, 0x00);
-	if (ret != SR_OK)
-		return ret;
-	ret = write_reg(sdi, 0x00, 0x04); /* bit 2 */
-	if (ret != SR_OK)
-		return ret;
-	ret = write_reg(sdi, 0x00, 0x00);
-	if (ret != SR_OK)
-		return ret;
-	ret = write_reg(sdi, 0x00, 0x08); /* bit 3 */
-	if (ret != SR_OK)
-		return ret;
-	ret = write_reg(sdi, 0x00, 0x00);
-	if (ret != SR_OK)
-		return ret;
-
-	sr_dbg("read dummy");
-	for (i = 0; i < 8; i++) {
-		ret = read_reg(sdi, 0x41 + i, &dummy[i]);
+		/* PLL/clock configuration via I2C master. */
+		ret = configure_clocks(sdi);
 		if (ret != SR_OK)
 			return ret;
-	}
 
-	/* Read and write back magic EEPROM value. */
-	sr_dbg("read/write magic");
-	ret = read_eeprom_magic(sdi, magic);
-	if (ret != SR_OK)
-		return ret;
-	for (i = 0; i < 16; i++) {
-		ret = write_reg(sdi, 0x17, magic[i]);
+	} else {
+		/* Reset the ADC? */
+		sr_dbg("reset ADC");
+		ret = write_reg(sdi, 0x00, 0x00);
 		if (ret != SR_OK)
 			return ret;
-	}
+		ret = write_reg(sdi, 0x00, 0x80);
+		if (ret != SR_OK)
+			return ret;
 
-	ret = read_temperature(sdi, &temperature);
-	if (ret != SR_OK)
-		return ret;
-	sr_dbg("temperature = %d", temperature);
+		sr_dbg("init ADC");
+		ret = write_adc(sdi, 0x11, 0x0444);
+		if (ret != SR_OK)
+			return ret;
+		ret = write_adc(sdi, 0x12, 0x0777);
+		if (ret != SR_OK)
+			return ret;
+		ret = write_adc(sdi, 0x25, 0x0000);
+		if (ret != SR_OK)
+			return ret;
+		ret = write_adc(sdi, 0x45, 0x0000);
+		if (ret != SR_OK)
+			return ret;
+		ret = write_adc(sdi, 0x2a, 0x1111);
+		if (ret != SR_OK)
+			return ret;
+		ret = write_adc(sdi, 0x2b, 0x1111);
+		if (ret != SR_OK)
+			return ret;
+		ret = write_adc(sdi, 0x46, 0x0004);
+		if (ret != SR_OK)
+			return ret;
+		ret = write_adc(sdi, 0x50, 0x0000);
+		if (ret != SR_OK)
+			return ret;
+		ret = write_adc(sdi, 0x55, 0x0020);
+		if (ret != SR_OK)
+			return ret;
+		ret = write_adc(sdi, 0x56, 0x0000);
+		if (ret != SR_OK)
+			return ret;
+
+		ret = write_reg(sdi, 0x15, 0x00);
+		if (ret != SR_OK)
+			return ret;
+
+		ret = write_adc(sdi, 0x0f, 0x0100);
+		if (ret != SR_OK)
+			return ret;
+
+		/* Resets */
+		sr_dbg("resets");
+		ret = write_reg(sdi, 0x00, 0x02); /* bit 1 */
+		if (ret != SR_OK)
+			return ret;
+		ret = write_reg(sdi, 0x00, 0x00);
+		if (ret != SR_OK)
+			return ret;
+		ret = write_reg(sdi, 0x00, 0x04); /* bit 2 */
+		if (ret != SR_OK)
+			return ret;
+		ret = write_reg(sdi, 0x00, 0x00);
+		if (ret != SR_OK)
+			return ret;
+		ret = write_reg(sdi, 0x00, 0x08); /* bit 3 */
+		if (ret != SR_OK)
+			return ret;
+		ret = write_reg(sdi, 0x00, 0x00);
+		if (ret != SR_OK)
+			return ret;
+
+		sr_dbg("read dummy");
+		for (i = 0; i < 8; i++) {
+			ret = read_reg(sdi, 0x41 + i, &dummy[i]);
+			if (ret != SR_OK)
+				return ret;
+		}
+
+		/* Read and write back magic EEPROM value. */
+		sr_dbg("read/write magic");
+		ret = read_eeprom_magic(sdi, magic);
+		if (ret != SR_OK)
+			return ret;
+		for (i = 0; i < 16; i++) {
+			ret = write_reg(sdi, 0x17, magic[i]);
+			if (ret != SR_OK)
+				return ret;
+		}
+
+		ret = read_temperature(sdi, &temperature);
+		if (ret != SR_OK)
+			return ret;
+		sr_dbg("temperature = %d", temperature);
+	}
 
 	/* Setting the LED doesn't work yet. */
 	/* set_led(sdi, 0x00, 0x00, 0xff); */
@@ -863,78 +1308,176 @@ SR_PRIV int saleae_logic_pro_prepare(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc = sdi->priv;
 	struct sr_usb_dev_inst *usb = sdi->conn;
-	uint8_t regs_unknown[][2] = {
-		{0x03, 0x0f},
-		{0x04, 0x00},
-		{0x05, 0x00},
-	};
-	uint8_t regs_config[][2] = {
-		{0x00, 0x00},
-		{0x08, 0x00}, /* Analog channel mask (LSB) */
-		{0x09, 0x00}, /* Analog channel mask (MSB) */
-		{0x06, 0x01}, /* Digital channel mask (LSB) */
-		{0x07, 0x00}, /* Digital channel mask (MSB) */
-		{0x0a, 0x00}, /* Analog sample rate? */
-		{0x0b, 0x64}, /* Digital sample rate? */
-		{0x0c, 0x00},
-		{0x0d, 0x00}, /* Analog mux rate? */
-		{0x0e, 0x01}, /* Digital mux rate? */
-		{0x12, 0x04},
-		{0x13, 0x00},
-		{0x14, 0xff}, /* Pre-divider? */
-	};
 	uint8_t start_req[] = {0x00, 0x01};
 	uint8_t start_rsp[2] = {};
 
 	configure_channels(sdi);
 
-	/* Digital channel mask and muxing */
-	regs_config[3][1] = devc->dig_channel_mask;
-	regs_config[4][1] = devc->dig_channel_mask >> 8;
-	regs_config[9][1] = devc->dig_channel_cnt;
+	if (devc->is_fx2) {
+		/* Validate channel count vs sample rate. */
+		unsigned int max_ch;
+		switch (devc->dig_samplerate) {
+		case SR_MHZ(100):
+			max_ch = 3; break;
+		case SR_MHZ(50):
+			max_ch = 6; break;
+		case SR_MHZ(40):
+			max_ch = 7; break;
+		default:
+			max_ch = 8; break;
+		}
+		if (devc->dig_channel_cnt > max_ch) {
+			sr_err("Logic 8: %" PRIu64 " MHz requires %u or fewer channels (%u enabled).",
+			       devc->dig_samplerate / 1000000,
+			       max_ch, devc->dig_channel_cnt);
+			return SR_ERR;
+		}
 
-	/* Samplerate */
-	switch (devc->dig_samplerate) {
-	case SR_MHZ(1):
-		regs_config[6][1] = 0x64;
-		break;
-	case SR_MHZ(2):
-		regs_config[6][1] = 0x32;
-		break;
-	case SR_KHZ(2500):
-		regs_config[6][1] = 0x28;
-		break;
-	case SR_MHZ(10):
-		regs_config[6][1] = 0x0a;
-		break;
-	case SR_MHZ(25):
-		regs_config[6][1] = 0x04;
-		regs_config[12][1] = 0x80;
-		break;
-	case SR_MHZ(50):
-		regs_config[6][1] = 0x02;
-		regs_config[12][1] = 0x40;
-		break;
-	default:
-		return SR_ERR_ARG;
-	}
+		/*
+		 * Logic 8 (FX2) FPGA register configuration.
+		 * 0x0e = dig_channel_cnt routes the 8 digital input
+		 * pins through the FPGA's channel mux, producing
+		 * 16-byte frames (2 bytes × 8 channels, 16 samples
+		 * per channel per frame).
+		 * 0x13=0x02 enables continuous streaming.
+		 */
+		uint8_t regs_fx2[][2] = {
+			{0x00, 0x00},
+			{0x08, 0x00}, /* No analog channels */
+			{0x06, 0xff}, /* Digital channel mask (all 8) */
+			{0x0a, 0x00},
+			{0x1b, 0x00},
+			{0x0b, 0x07}, /* Sample rate divisor */
+			{0x0c, 0x00},
+			{0x0d, 0x00},
+			{0x0e, 0x08}, /* Digital mux: 8 channels */
+			{0x13, 0x02}, /* Continuous streaming */
+			{0x14, 0x04}, /* Clock pre-divider */
+		};
 
-	/*
-	 * Logic 8 (FX2) does not have the ATECC crypto chip, so skip
-	 * authentication. The START_CAPTURE command also has no response
-	 * on FX2.
-	 */
-	if (!devc->is_fx2)
+		/* Digital channel mask and mux count */
+		regs_fx2[2][1] = devc->dig_channel_mask;
+		regs_fx2[8][1] = devc->dig_channel_cnt;
+
+		/* Sample rate: 0x0b=divisor, 0x14=pre-divider. */
+		switch (devc->dig_samplerate) {
+		case SR_MHZ(1):
+			regs_fx2[5][1] = 0xc7;
+			regs_fx2[10][1] = 0x50;
+			break;
+		case SR_MHZ(4):
+			regs_fx2[5][1] = 0x63;
+			regs_fx2[10][1] = 0x28;
+			break;
+		case SR_MHZ(5):
+			regs_fx2[5][1] = 0x31;
+			regs_fx2[10][1] = 0x14;
+			break;
+		case SR_MHZ(8):
+			regs_fx2[5][1] = 0x27;
+			regs_fx2[10][1] = 0x10;
+			break;
+		case SR_MHZ(10):
+			regs_fx2[5][1] = 0x18;
+			regs_fx2[10][1] = 0x0a;
+			break;
+		case SR_MHZ(20):
+			regs_fx2[5][1] = 0x13;
+			regs_fx2[10][1] = 0x08;
+			break;
+		case SR_MHZ(25):
+			regs_fx2[5][1] = 0x07;
+			regs_fx2[10][1] = 0x04;
+			break;
+		case SR_MHZ(40):
+			regs_fx2[5][1] = 0x04;
+			regs_fx2[10][1] = 0x03;
+			break;
+		case SR_MHZ(50):
+			regs_fx2[5][1] = 0x03;
+			regs_fx2[10][1] = 0x03;
+			break;
+		case SR_MHZ(100):
+			regs_fx2[5][1] = 0x03;
+			regs_fx2[10][1] = 0x05;
+			break;
+		default:
+			sr_warn("Logic 8: unsupported sample rate %" PRIu64 ".",
+				devc->dig_samplerate);
+			break;
+		}
+
+		write_regs(sdi, ARRAY_AND_SIZE(regs_fx2));
+	} else {
+		uint8_t regs_unknown[][2] = {
+			{0x03, 0x0f},
+			{0x04, 0x00},
+			{0x05, 0x00},
+		};
+		uint8_t regs_config[][2] = {
+			{0x00, 0x00},
+			{0x08, 0x00}, /* Analog channel mask (LSB) */
+			{0x09, 0x00}, /* Analog channel mask (MSB) */
+			{0x06, 0x01}, /* Digital channel mask (LSB) */
+			{0x07, 0x00}, /* Digital channel mask (MSB) */
+			{0x0a, 0x00}, /* Analog sample rate? */
+			{0x0b, 0x64}, /* Digital sample rate? */
+			{0x0c, 0x00},
+			{0x0d, 0x00}, /* Analog mux rate? */
+			{0x0e, 0x01}, /* Digital mux rate? */
+			{0x12, 0x04},
+			{0x13, 0x00},
+			{0x14, 0xff}, /* Pre-divider? */
+		};
+
+		/* Digital channel mask and muxing */
+		regs_config[3][1] = devc->dig_channel_mask;
+		regs_config[4][1] = devc->dig_channel_mask >> 8;
+		regs_config[9][1] = devc->dig_channel_cnt;
+
+		/* Samplerate */
+		switch (devc->dig_samplerate) {
+		case SR_MHZ(1):
+			regs_config[6][1] = 0x64;
+			break;
+		case SR_MHZ(2):
+			regs_config[6][1] = 0x32;
+			break;
+		case SR_KHZ(2500):
+			regs_config[6][1] = 0x28;
+			break;
+		case SR_MHZ(10):
+			regs_config[6][1] = 0x0a;
+			break;
+		case SR_MHZ(25):
+			regs_config[6][1] = 0x04;
+			regs_config[12][1] = 0x80;
+			break;
+		case SR_MHZ(50):
+			regs_config[6][1] = 0x02;
+			regs_config[12][1] = 0x40;
+			break;
+		default:
+			return SR_ERR_ARG;
+		}
+
 		authenticate(sdi);
 
-	write_reg(sdi, 0x15, 0x03);
-	write_regs(sdi, ARRAY_AND_SIZE(regs_unknown));
-	write_regs(sdi, ARRAY_AND_SIZE(regs_config));
+		write_reg(sdi, 0x15, 0x03);
+		write_regs(sdi, ARRAY_AND_SIZE(regs_unknown));
+		write_regs(sdi, ARRAY_AND_SIZE(regs_config));
+	}
 
 	if (devc->is_fx2) {
-		uint8_t start_enc[2];
+		uint8_t stop_req[] = {0x00, 0x02};
+		uint8_t stop_enc[2], start_enc[2];
 		int xfer;
 
+		/* STOP → START for capture. */
+		encrypt(sdi, stop_req, stop_enc, sizeof(stop_req));
+		libusb_bulk_transfer(usb->devhdl, 1,
+				     stop_enc, sizeof(stop_enc),
+				     &xfer, 1000);
 		encrypt(sdi, start_req, start_enc, sizeof(start_req));
 		libusb_bulk_transfer(usb->devhdl, 1,
 				     start_enc, sizeof(start_enc),
@@ -953,6 +1496,7 @@ SR_PRIV int saleae_logic_pro_start(const struct sr_dev_inst *sdi)
 
 	devc->conv_size = 0;
 	devc->batch_index = 0;
+	devc->fx2_partial_len = 0;
 
 	write_reg(sdi, 0x00, 0x01);
 
@@ -1019,6 +1563,91 @@ static void saleae_logic_pro_send_data(const struct sr_dev_inst *sdi,
  * One batch from the device consists of 32 samples per active digital channel.
  * This stream of batches is packed into USB packets with 16384 bytes each.
  */
+
+/*
+ * FX2 (Logic 8) data converter.
+ *
+ * With 0x0e = dig_channel_cnt (8), the FPGA outputs time-multiplexed
+ * digital samples in 16-byte frames:
+ *   bytes 0-1:   CH0 (16 samples, MSB first)
+ *   bytes 2-3:   CH1
+ *   ...
+ *   bytes 14-15: CH7
+ *
+ * Each 16-bit word contains 16 consecutive samples for one channel,
+ * bit 15 = earliest sample. We transpose this into the sigrok format:
+ * 16 output bytes, each containing one sample of all 8 channels
+ * (bit 0 = CH0, bit 7 = CH7).
+ */
+#define FX2_SAMPLES_PER_FRAME 16
+
+static void saleae_logic_pro_convert_fx2_frame(struct dev_context *devc,
+					       uint8_t *dst,
+					       unsigned int *dst_pos,
+					       const uint8_t *frame)
+{
+	uint16_t ch_words[8];
+	unsigned int ch, s;
+
+	for (ch = 0; ch < devc->dig_channel_cnt; ch++)
+		ch_words[ch] = (frame[ch * 2] << 8) | frame[ch * 2 + 1];
+
+	for (s = 0; s < FX2_SAMPLES_PER_FRAME; s++) {
+		uint8_t sample = 0;
+		uint16_t mask = 1 << (15 - s);
+		for (ch = 0; ch < devc->dig_channel_cnt; ch++)
+			if (ch_words[ch] & mask)
+				sample |= devc->dig_channel_masks[ch];
+		dst[(*dst_pos)++] = sample;
+	}
+}
+
+static void saleae_logic_pro_convert_fx2(const struct sr_dev_inst *sdi,
+					 const uint8_t *src, size_t len)
+{
+	struct dev_context *devc = sdi->priv;
+	uint8_t *dst = devc->conv_buffer;
+	unsigned int dst_pos = 0;
+	unsigned int frame_size;
+
+	frame_size = devc->dig_channel_cnt * 2;
+
+	/* Complete partial frame from previous transfer. */
+	if (devc->fx2_partial_len > 0) {
+		unsigned int needed = frame_size - devc->fx2_partial_len;
+		if (len < needed) {
+			memcpy(devc->fx2_partial + devc->fx2_partial_len,
+			       src, len);
+			devc->fx2_partial_len += len;
+			devc->conv_size = 0;
+			return;
+		}
+		memcpy(devc->fx2_partial + devc->fx2_partial_len,
+		       src, needed);
+		saleae_logic_pro_convert_fx2_frame(devc, dst, &dst_pos,
+						   devc->fx2_partial);
+		src += needed;
+		len -= needed;
+		devc->fx2_partial_len = 0;
+	}
+
+	/* Process complete frames. */
+	while (len >= frame_size) {
+		saleae_logic_pro_convert_fx2_frame(devc, dst, &dst_pos, src);
+		src += frame_size;
+		len -= frame_size;
+	}
+
+	/* Save leftover bytes for next transfer. */
+	if (len > 0) {
+		memcpy(devc->fx2_partial, src, len);
+		devc->fx2_partial_len = len;
+	}
+
+	devc->conv_size = dst_pos;
+}
+
+/* FX3 (Logic Pro 16): 16-bit output, 64 bytes per batch. */
 static void saleae_logic_pro_convert_data(const struct sr_dev_inst *sdi,
 					 const uint32_t *src, size_t srccnt)
 {
@@ -1067,32 +1696,44 @@ SR_PRIV void LIBUSB_CALL saleae_logic_pro_receive_data(struct libusb_transfer *t
 
 	switch (transfer->status) {
 	case LIBUSB_TRANSFER_NO_DEVICE:
-		sr_dbg("FIXME no device");
+		devc->submitted_transfers--;
+		g_free(transfer->buffer);
+		libusb_free_transfer(transfer);
 		return;
 	case LIBUSB_TRANSFER_COMPLETED:
 	case LIBUSB_TRANSFER_TIMED_OUT: /* We may have received some data though. */
 		break;
+	case LIBUSB_TRANSFER_CANCELLED:
+		devc->submitted_transfers--;
+		g_free(transfer->buffer);
+		libusb_free_transfer(transfer);
+		return;
 	default:
-		/* FIXME */
+		sr_dbg("USB transfer error: status %d", transfer->status);
+		devc->submitted_transfers--;
+		g_free(transfer->buffer);
+		libusb_free_transfer(transfer);
 		return;
 	}
 
-	saleae_logic_pro_convert_data(sdi, (uint32_t*)transfer->buffer, 16 * 1024 / 4);
-
-	if (devc->unit_size == 1) {
-		/* Pack 16-bit samples to 8-bit for 8-channel devices. */
-		uint16_t *src = (uint16_t *)devc->conv_buffer;
-		uint8_t *dst = devc->conv_buffer;
-		unsigned int nsamples = devc->conv_size / 2;
-		unsigned int i;
-		for (i = 0; i < nsamples; i++)
-			dst[i] = src[i] & 0xff;
-		saleae_logic_pro_send_data(sdi, devc->conv_buffer, nsamples, 1);
+	if (devc->is_fx2) {
+		saleae_logic_pro_convert_fx2(sdi, transfer->buffer,
+					     transfer->actual_length);
+		if (devc->conv_size > 0)
+			saleae_logic_pro_send_data(sdi, devc->conv_buffer,
+						   devc->conv_size, 1);
 	} else {
+		saleae_logic_pro_convert_data(sdi, (uint32_t*)transfer->buffer,
+					      transfer->actual_length / 4);
 		saleae_logic_pro_send_data(sdi, devc->conv_buffer,
 					   devc->conv_size, 2);
 	}
 
-	if ((ret = libusb_submit_transfer(transfer)) != LIBUSB_SUCCESS)
-		sr_dbg("FIXME resubmit failed");
+	if ((ret = libusb_submit_transfer(transfer)) != LIBUSB_SUCCESS) {
+		sr_err("Failed to resubmit transfer: %s.",
+		       libusb_error_name(ret));
+		devc->submitted_transfers--;
+		g_free(transfer->buffer);
+		libusb_free_transfer(transfer);
+	}
 }

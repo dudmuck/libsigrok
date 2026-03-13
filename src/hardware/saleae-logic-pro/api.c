@@ -99,9 +99,15 @@ static const uint64_t samplerates[] = {
 	SR_MHZ(1),
 	SR_MHZ(2),
 	SR_KHZ(2500),
+	SR_MHZ(4),
+	SR_MHZ(5),
+	SR_MHZ(8),
 	SR_MHZ(10),
+	SR_MHZ(20),
 	SR_MHZ(25),
+	SR_MHZ(40),
 	SR_MHZ(50),
+	SR_MHZ(100),
 };
 
 #define FW_HEADER_SIZE 7
@@ -181,6 +187,7 @@ static gboolean scan_firmware(libusb_device *dev,
 {
 	struct libusb_device_descriptor des;
 	struct libusb_device_handle *hdl;
+	struct libusb_config_descriptor *config;
 	gboolean ret;
 	unsigned char strdesc[64];
 
@@ -188,6 +195,25 @@ static gboolean scan_firmware(libusb_device *dev,
 	ret = FALSE;
 
 	libusb_get_device_descriptor(dev, &des);
+
+	if (model->is_fx2) {
+		/*
+		 * The Saleae Logic 8 FX2 firmware has no USB string
+		 * descriptors. Detect firmware by checking whether the
+		 * active configuration has endpoints in alt setting 0.
+		 * Without firmware, the EEPROM descriptors have alt 0
+		 * with 0 endpoints; with firmware loaded, alt 0 has 4
+		 * endpoints (0x01, 0x81, 0x82, 0x06).
+		 */
+		if (libusb_get_active_config_descriptor(dev, &config) != 0)
+			return FALSE;
+		if (config->bNumInterfaces > 0 &&
+		    config->interface[0].num_altsetting > 0 &&
+		    config->interface[0].altsetting[0].bNumEndpoints > 0)
+			ret = TRUE;
+		libusb_free_config_descriptor(config);
+		return ret;
+	}
 
 	if (libusb_open(dev, &hdl) != 0)
 		goto out;
@@ -278,7 +304,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 	if (fw_loaded) {
 		/* Give the device some time to come back and scan again. */
 		libusb_free_device_list(devlist, 1);
-		g_usleep(1500 * 1000);
+		g_usleep(3000 * 1000);
 		libusb_get_device_list(drvc->sr_ctx->libusb_ctx, &devlist);
 	}
 
@@ -453,12 +479,9 @@ static int dev_acquisition_handle(int fd, int revents, void *cb_data)
 	struct timeval tv = ALL_ZERO;
 
 	(void)fd;
+	(void)revents;
 
 	libusb_handle_events_timeout(drvc->sr_ctx->libusb_ctx, &tv);
-
-	/* Handle timeout */
-	if (!revents)
-		sr_dev_acquisition_stop(sdi);
 
 	return TRUE;
 }
@@ -480,6 +503,10 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 
 	devc->conv_buffer = g_malloc(CONV_BUFFER_SIZE);
 
+	ret = usb_source_add(sdi->session, drvc->sr_ctx, BUF_TIMEOUT, dev_acquisition_handle, (void *)sdi);
+	if (ret != SR_OK)
+		return ret;
+
 	devc->num_transfers = BUF_COUNT;
 	devc->transfers = g_malloc0(sizeof(*devc->transfers) * BUF_COUNT);
 	for (i = 0; i < devc->num_transfers; i++) {
@@ -500,8 +527,6 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		devc->submitted_transfers++;
 	}
 
-	usb_source_add(sdi->session, drvc->sr_ctx, BUF_TIMEOUT, dev_acquisition_handle, (void *)sdi);
-
 	std_session_send_df_header(sdi);
 
 	saleae_logic_pro_start(sdi);
@@ -515,14 +540,27 @@ static int dev_acquisition_stop(struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc = sdi->priv;
 	struct drv_context *drvc = sdi->driver->context;
+	struct timeval tv = ALL_ZERO;
 
 	saleae_logic_pro_stop(sdi);
+
+	/* Cancel all outstanding USB transfers. */
+	dev_acquisition_abort(sdi);
+
+	/* Process events until all transfers have completed. */
+	while (devc->submitted_transfers > 0)
+		libusb_handle_events_timeout(drvc->sr_ctx->libusb_ctx, &tv);
+
+	g_free(devc->transfers);
+	devc->transfers = NULL;
+	devc->num_transfers = 0;
 
 	std_session_send_df_end(sdi);
 
 	usb_source_remove(sdi->session, drvc->sr_ctx);
 
 	g_free(devc->conv_buffer);
+	devc->conv_buffer = NULL;
 
 	return SR_OK;
 }

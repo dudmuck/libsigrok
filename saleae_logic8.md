@@ -46,12 +46,26 @@ Typical steps:
        cp saleae-logic8-fpga.bitstream ~/.local/share/sigrok-firmware/
 
 
+## Supported sample rates
+
+The maximum sample rate depends on the number of enabled channels:
+
+| Channels | Max rate | Available rates |
+|----------|----------|-----------------|
+| 1-3      | 100 MHz  | 1, 4, 5, 8, 10, 20, 25, 40, 50, 100 MHz |
+| 4-6      | 50 MHz   | 1, 4, 5, 8, 10, 20, 25, 40, 50 MHz |
+| 7        | 40 MHz   | 1, 4, 5, 8, 10, 20, 25, 40 MHz |
+| 8        | 25 MHz   | 1, 4, 5, 8, 10, 20, 25 MHz |
+
+These match the rates supported by the Saleae Logic 2 software.
+
+
 ## Startup sequence
 
 When sigrok-cli (or another frontend) opens the device:
 
-1. If the FX2 chip has no firmware loaded (identified by USB descriptor
-   strings not matching "Saleae Inc" / "Logic 8"), the driver uploads
+1. If the FX2 chip has no firmware loaded (detected by checking whether
+   alt setting 0 has endpoints), the driver uploads
    **saleae-logic8-fx2.fw** using the Cypress vendor request protocol
    and waits for the device to re-enumerate.
 
@@ -64,8 +78,29 @@ When sigrok-cli (or another frontend) opens the device:
 3. After bitstream upload, the driver verifies FPGA configuration by
    writing and reading back a scratch register (0x7f = 0xaa).
 
-4. The ADC is initialised, configuration registers are written, and the
-   device is ready for acquisition.
+4. The HMCAD1100 ADC is initialised, PLL/clock configuration is
+   performed via the FPGA's I2C master, and the device is ready for
+   acquisition.
+
+
+## Usage examples
+
+Capture 1 second of all 8 channels at 25 MHz:
+
+    sigrok-cli --driver saleae-logic-pro --config samplerate=25M \
+        --continuous --time 1s -o capture.sr
+
+Capture at 50 MHz with 6 channels (disable channels 6 and 7):
+
+    sigrok-cli --driver saleae-logic-pro --config samplerate=50M \
+        --channels 0-5 --continuous --time 1s -o capture.sr
+
+Use PulseView for interactive capture:
+
+    pulseview
+
+Select "Saleae Logic 8" from the device dropdown. Disable channels
+via the probe configuration button to enable faster sample rates.
 
 
 ## Troubleshooting
