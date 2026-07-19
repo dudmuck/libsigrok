@@ -124,7 +124,8 @@ libsigrok_la_SOURCES += \
 	src/transform/transform.c \
 	src/transform/nop.c \
 	src/transform/scale.c \
-	src/transform/invert.c
+	src/transform/invert.c \
+	src/transform/deglitch.c
 
 # SCPI support
 libsigrok_la_SOURCES += \
