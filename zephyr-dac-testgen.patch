@@ -1,0 +1,211 @@
+diff --git a/samples/drivers/dac/prj.conf b/samples/drivers/dac/prj.conf
+index 5ddebe8a96e..1ee70315401 100644
+--- a/samples/drivers/dac/prj.conf
++++ b/samples/drivers/dac/prj.conf
+@@ -1 +1,2 @@
+ CONFIG_DAC=y
++CONFIG_SHELL=y
+diff --git a/samples/drivers/dac/src/main.c b/samples/drivers/dac/src/main.c
+index 71657a19341..380f5c4e766 100644
+--- a/samples/drivers/dac/src/main.c
++++ b/samples/drivers/dac/src/main.c
+@@ -7,6 +7,8 @@
+ #include <zephyr/kernel.h>
+ #include <zephyr/sys/printk.h>
+ #include <zephyr/drivers/dac.h>
++#include <zephyr/shell/shell.h>
++#include <stdlib.h>
+ 
+ #define ZEPHYR_USER_NODE DT_PATH(zephyr_user)
+ 
+@@ -23,6 +25,10 @@
+ #define DAC_RESOLUTION 0
+ #endif
+ 
++#define DAC_MAX_VALUE ((1U << DAC_RESOLUTION) - 1)
++#define DAC_REF_MV 3300
++#define DAC_RAMP_SLEEP_MS 1
++
+ static const struct device *const dac_dev = DEVICE_DT_GET(DAC_NODE);
+ 
+ static const struct dac_channel_cfg dac_ch_cfg = {
+@@ -32,9 +38,126 @@ static const struct dac_channel_cfg dac_ch_cfg = {
+ 	.buffered = false,
+ #else
+ 	.buffered = true,
+-#endif /* CONFIG_DAC_BUFFER_NOT_SUPPORT */
++#endif
+ };
+ 
++static volatile uint32_t ramp_step = 1;
++static volatile bool ramp_running = true;
++static volatile bool ramp_reverse;
++
++static int cmd_dac_set_mv(const struct shell *sh, size_t argc, char **argv)
++{
++	unsigned long mv = strtoul(argv[1], NULL, 10);
++
++	if (mv > DAC_REF_MV) {
++		shell_error(sh, "Max voltage is %d mV", DAC_REF_MV);
++		return -EINVAL;
++	}
++
++	ramp_running = false;
++
++	uint32_t dac_val = (uint32_t)((uint64_t)mv * DAC_MAX_VALUE / DAC_REF_MV);
++	int ret = dac_write_value(dac_dev, DAC_CHANNEL_ID, dac_val);
++
++	if (ret != 0) {
++		shell_error(sh, "dac_write_value() failed: %d", ret);
++		return ret;
++	}
++
++	shell_print(sh, "DAC ch%d = %lu mV (raw %u/%u)",
++		    DAC_CHANNEL_ID, mv, dac_val, DAC_MAX_VALUE);
++	return 0;
++}
++
++static int cmd_dac_set_raw(const struct shell *sh, size_t argc, char **argv)
++{
++	unsigned long val = strtoul(argv[1], NULL, 10);
++
++	if (val > DAC_MAX_VALUE) {
++		shell_error(sh, "Max raw value is %u", DAC_MAX_VALUE);
++		return -EINVAL;
++	}
++
++	ramp_running = false;
++
++	int ret = dac_write_value(dac_dev, DAC_CHANNEL_ID, (uint32_t)val);
++
++	if (ret != 0) {
++		shell_error(sh, "dac_write_value() failed: %d", ret);
++		return ret;
++	}
++
++	unsigned long mv = (uint64_t)val * DAC_REF_MV / DAC_MAX_VALUE;
++
++	shell_print(sh, "DAC ch%d = raw %lu (~%lu mV)",
++		    DAC_CHANNEL_ID, val, mv);
++	return 0;
++}
++
++static int cmd_dac_ramp(const struct shell *sh, size_t argc, char **argv)
++{
++	unsigned long step = strtoul(argv[1], NULL, 10);
++
++	if (step == 0 || step > DAC_MAX_VALUE) {
++		shell_error(sh, "Step must be 1-%u", DAC_MAX_VALUE);
++		return -EINVAL;
++	}
++
++	ramp_step = (uint32_t)step;
++	ramp_reverse = false;
++	ramp_running = true;
++
++	uint32_t steps = (DAC_MAX_VALUE / (uint32_t)step) + 1;
++	uint32_t period_ms = steps * DAC_RAMP_SLEEP_MS;
++
++	shell_print(sh, "Ramping up with step %lu (%u steps, ~%u ms period)",
++		    step, steps, period_ms);
++	return 0;
++}
++
++static int cmd_dac_ramp_down(const struct shell *sh, size_t argc, char **argv)
++{
++	unsigned long step = strtoul(argv[1], NULL, 10);
++
++	if (step == 0 || step > DAC_MAX_VALUE) {
++		shell_error(sh, "Step must be 1-%u", DAC_MAX_VALUE);
++		return -EINVAL;
++	}
++
++	ramp_step = (uint32_t)step;
++	ramp_reverse = true;
++	ramp_running = true;
++
++	uint32_t steps = (DAC_MAX_VALUE / (uint32_t)step) + 1;
++	uint32_t period_ms = steps * DAC_RAMP_SLEEP_MS;
++
++	shell_print(sh, "Ramping down with step %lu (%u steps, ~%u ms period)",
++		    step, steps, period_ms);
++	return 0;
++}
++
++static int cmd_dac_stop(const struct shell *sh, size_t argc, char **argv)
++{
++	ramp_running = false;
++	shell_print(sh, "Ramp stopped");
++	return 0;
++}
++
++SHELL_STATIC_SUBCMD_SET_CREATE(sub_dac,
++	SHELL_CMD_ARG(mv, NULL, "Set DAC output in millivolts: dac mv <0-3300>",
++		      cmd_dac_set_mv, 2, 0),
++	SHELL_CMD_ARG(raw, NULL, "Set DAC raw value: dac raw <0-4095>",
++		      cmd_dac_set_raw, 2, 0),
++	SHELL_CMD_ARG(ramp, NULL, "Start ramp up: dac ramp <step>",
++		      cmd_dac_ramp, 2, 0),
++	SHELL_CMD_ARG(ramp_down, NULL, "Start ramp down: dac ramp_down <step>",
++		      cmd_dac_ramp_down, 2, 0),
++	SHELL_CMD(stop, NULL, "Stop ramp", cmd_dac_stop),
++	SHELL_SUBCMD_SET_END
++);
++
++SHELL_CMD_REGISTER(dac, &sub_dac, "DAC commands", NULL);
++
+ int main(void)
+ {
+ 	if (!device_is_ready(dac_dev)) {
+@@ -49,30 +172,32 @@ int main(void)
+ 		return 0;
+ 	}
+ 
+-	printk("Generating sawtooth signal at DAC channel %d.\n",
+-		DAC_CHANNEL_ID);
++	printk("DAC shell ready on channel %d (%d-bit)\n",
++	       DAC_CHANNEL_ID, DAC_RESOLUTION);
++
++	uint32_t val = 0;
++
+ 	while (1) {
+-		/* Number of valid DAC values, e.g. 4096 for 12-bit DAC */
+-		const int dac_values = 1U << DAC_RESOLUTION;
+-
+-		/*
+-		 * 1 msec sleep leads to about 4 sec signal period for 12-bit
+-		 * DACs. For DACs with lower resolution, sleep time needs to
+-		 * be increased.
+-		 * Make sure to sleep at least 1 msec even for future 16-bit
+-		 * DACs (lowering signal frequency).
+-		 */
+-		const int sleep_time = 4096 / dac_values > 0 ?
+-			4096 / dac_values : 1;
+-
+-		for (int i = 0; i < dac_values; i++) {
+-			ret = dac_write_value(dac_dev, DAC_CHANNEL_ID, i);
++		if (ramp_running) {
++			ret = dac_write_value(dac_dev, DAC_CHANNEL_ID, val);
+ 			if (ret != 0) {
+-				printk("dac_write_value() failed with code %d\n", ret);
++				printk("dac_write_value() failed: %d\n", ret);
+ 				return 0;
+ 			}
+-			k_sleep(K_MSEC(sleep_time));
++			if (ramp_reverse) {
++				if (val < ramp_step) {
++					val = DAC_MAX_VALUE;
++				} else {
++					val -= ramp_step;
++				}
++			} else {
++				val += ramp_step;
++				if (val > DAC_MAX_VALUE) {
++					val = 0;
++				}
++			}
+ 		}
++		k_sleep(K_MSEC(DAC_RAMP_SLEEP_MS));
+ 	}
+ 	return 0;
+ }

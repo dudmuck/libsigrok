@@ -1,0 +1,853 @@
+diff --git a/src/hardware/saleae-logic-pro/api.c b/src/hardware/saleae-logic-pro/api.c
+index ea1c1acb..d12bec5d 100644
+--- a/src/hardware/saleae-logic-pro/api.c
++++ b/src/hardware/saleae-logic-pro/api.c
+@@ -38,7 +38,8 @@ struct saleae_model_info {
+ 	const char *model_name;
+ 	const char *fx_firmware;
+ 	const char *fpga_bitstream;
+-	unsigned int num_channels;
++	unsigned int num_logic_channels;
++	unsigned int num_analog_channels;
+ 	unsigned int unit_size;
+ 	gboolean is_fx2;
+ };
+@@ -51,7 +52,8 @@ static const struct saleae_model_info models[] = {
+ 		.model_name = "Logic Pro 16",
+ 		.fx_firmware = "saleae-logicpro16-fx3.fw",
+ 		.fpga_bitstream = "saleae-logicpro16-fpga.bitstream",
+-		.num_channels = 16,
++		.num_logic_channels = 16,
++		.num_analog_channels = 0,
+ 		.unit_size = 2,
+ 		.is_fx2 = FALSE,
+ 	},
+@@ -62,7 +64,8 @@ static const struct saleae_model_info models[] = {
+ 		.model_name = "Logic 8",
+ 		.fx_firmware = "saleae-logic8-fx2.fw",
+ 		.fpga_bitstream = "saleae-logic8-fpga.bitstream",
+-		.num_channels = 8,
++		.num_logic_channels = 8,
++		.num_analog_channels = 8,
+ 		.unit_size = 1,
+ 		.is_fx2 = TRUE,
+ 	},
+@@ -82,6 +85,7 @@ static const uint32_t scanopts[] = {
+ 
+ static const uint32_t drvopts[] = {
+ 	SR_CONF_LOGIC_ANALYZER,
++	SR_CONF_OSCILLOSCOPE,
+ };
+ 
+ static const uint32_t devopts[] = {
+@@ -90,9 +94,13 @@ static const uint32_t devopts[] = {
+ 	SR_CONF_SAMPLERATE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+ };
+ 
+-static const char *channel_names[] = {
+-	"0", "1", "2", "3", "4", "5", "6", "7",
+-	"8", "9", "10", "11", "12", "13", "14", "15",
++static const char *channel_names_logic[] = {
++	"D0", "D1", "D2", "D3", "D4", "D5", "D6", "D7",
++	"D8", "D9", "D10", "D11", "D12", "D13", "D14", "D15",
++};
++
++static const char *channel_names_analog[] = {
++	"A0", "A1", "A2", "A3", "A4", "A5", "A6", "A7",
+ };
+ 
+ static const uint64_t samplerates[] = {
+@@ -343,9 +351,30 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
+ 		sdi->model = g_strdup(model->model_name);
+ 		sdi->connection_id = g_strdup(connection_id);
+ 
+-		for (unsigned int j = 0; j < model->num_channels; j++)
+-			sr_channel_new(sdi, j, SR_CHANNEL_LOGIC, TRUE,
+-				       channel_names[j]);
++		{
++			struct sr_channel_group *cg;
++			struct sr_channel *ch;
++			unsigned int ch_idx = 0;
++
++			/* Logic channels, all in one channel group. */
++			cg = sr_channel_group_new(sdi, "Logic", NULL);
++			for (unsigned int j = 0; j < model->num_logic_channels; j++) {
++				ch = sr_channel_new(sdi, ch_idx++,
++					SR_CHANNEL_LOGIC, TRUE,
++					channel_names_logic[j]);
++				cg->channels = g_slist_append(cg->channels, ch);
++			}
++
++			/* Analog channels, each in its own channel group. */
++			for (unsigned int j = 0; j < model->num_analog_channels; j++) {
++				ch = sr_channel_new(sdi, ch_idx++,
++					SR_CHANNEL_ANALOG, FALSE,
++					channel_names_analog[j]);
++				cg = sr_channel_group_new(sdi,
++					channel_names_analog[j], NULL);
++				cg->channels = g_slist_append(NULL, ch);
++			}
++		}
+ 
+ 		sr_dbg("Found a %s device.", model->model_name);
+ 		sdi->status = SR_ST_INACTIVE;
+@@ -357,6 +386,13 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
+ 		devc->fpga_bitstream = model->fpga_bitstream;
+ 		devc->unit_size = model->unit_size;
+ 		devc->is_fx2 = model->is_fx2;
++
++		/* Default analog calibration (nominal range). */
++		for (unsigned int j = 0; j < LOGIC8_MAX_ANA_CHANNELS; j++) {
++			devc->ana_vmin[j] = -0.4f;
++			devc->ana_vmax[j] = 5.3f;
++		}
++
+ 		sdi->priv = devc;
+ 		devices = g_slist_append(devices, sdi);
+ 	}
+@@ -386,7 +422,15 @@ static int dev_open(struct sr_dev_inst *sdi)
+ 	if (devc->dig_samplerate == 0)
+ 		devc->dig_samplerate = samplerates[3];
+ 
+-	return saleae_logic_pro_init(sdi);
++	ret = saleae_logic_pro_init(sdi);
++	if (ret != SR_OK)
++		return ret;
++
++	/* Load analog calibration from Logic 2's .cal file if available. */
++	if (devc->is_fx2)
++		saleae_logic_pro_load_calibration(sdi);
++
++	return SR_OK;
+ }
+ 
+ static int dev_close(struct sr_dev_inst *sdi)
+@@ -447,6 +491,10 @@ static int config_set(uint32_t key, GVariant *data,
+ static int config_list(uint32_t key, GVariant **data,
+ 	const struct sr_dev_inst *sdi, const struct sr_channel_group *cg)
+ {
++	/* No per-channel-group options. */
++	if (cg)
++		return SR_ERR_NA;
++
+ 	switch (key) {
+ 	case SR_CONF_SCAN_OPTIONS:
+ 	case SR_CONF_DEVICE_OPTIONS:
+@@ -502,6 +550,10 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
+ 	usb = sdi->conn;
+ 
+ 	devc->conv_buffer = g_malloc(CONV_BUFFER_SIZE);
++	if (devc->ana_channel_cnt > 0)
++		devc->ana_conv_buffer = g_malloc(ANA_CONV_BUFFER_SIZE * sizeof(float));
++	else
++		devc->ana_conv_buffer = NULL;
+ 
+ 	ret = usb_source_add(sdi->session, drvc->sr_ctx, BUF_TIMEOUT, dev_acquisition_handle, (void *)sdi);
+ 	if (ret != SR_OK)
+@@ -561,6 +613,10 @@ static int dev_acquisition_stop(struct sr_dev_inst *sdi)
+ 
+ 	g_free(devc->conv_buffer);
+ 	devc->conv_buffer = NULL;
++	g_free(devc->ana_conv_buffer);
++	devc->ana_conv_buffer = NULL;
++	g_slist_free(devc->ana_channel_list);
++	devc->ana_channel_list = NULL;
+ 
+ 	return SR_OK;
+ }
+diff --git a/src/hardware/saleae-logic-pro/protocol.c b/src/hardware/saleae-logic-pro/protocol.c
+index f8630e59..1dfc9ae1 100644
+--- a/src/hardware/saleae-logic-pro/protocol.c
++++ b/src/hardware/saleae-logic-pro/protocol.c
+@@ -701,24 +701,50 @@ static int set_led(const struct sr_dev_inst *sdi, uint8_t r, uint8_t g, uint8_t
+ static int configure_channels(const struct sr_dev_inst *sdi)
+ {
+ 	struct dev_context *devc = sdi->priv;
+-	const struct sr_channel *c;
++	struct sr_channel *c;
+ 	const GSList *l;
+ 	uint16_t mask;
++	unsigned int num_logic;
++
++	/*
++	 * Count logic channels to determine the analog index offset.
++	 * Logic channels are listed first in sdi->channels.
++	 */
++	num_logic = 0;
++	for (l = sdi->channels; l; l = l->next) {
++		c = l->data;
++		if (c->type == SR_CHANNEL_LOGIC)
++			num_logic++;
++	}
+ 
+ 	devc->dig_channel_cnt = 0;
+ 	devc->dig_channel_mask = 0;
++	devc->ana_channel_cnt = 0;
++	devc->ana_channel_mask = 0;
++	g_slist_free(devc->ana_channel_list);
++	devc->ana_channel_list = NULL;
++
+ 	for (l = sdi->channels; l; l = l->next) {
+ 		c = l->data;
+ 		if (!c->enabled)
+ 			continue;
+ 
+-		mask = 1 << c->index;
+-		devc->dig_channel_masks[devc->dig_channel_cnt++] = mask;
+-		devc->dig_channel_mask |= mask;
+-
++		if (c->type == SR_CHANNEL_LOGIC) {
++			mask = 1 << c->index;
++			devc->dig_channel_masks[devc->dig_channel_cnt++] = mask;
++			devc->dig_channel_mask |= mask;
++		} else if (c->type == SR_CHANNEL_ANALOG) {
++			unsigned int ana_idx = c->index - num_logic;
++			devc->ana_channel_mask |= (1 << ana_idx);
++			devc->ana_channel_cnt++;
++			devc->ana_channel_list = g_slist_append(
++				devc->ana_channel_list, c);
++		}
+ 	}
+-	sr_dbg("%d channels enabled (0x%04x)",
+-	       devc->dig_channel_cnt, devc->dig_channel_mask);
++	sr_dbg("%d digital channels enabled (0x%04x), "
++	       "%d analog channels enabled (0x%02x)",
++	       devc->dig_channel_cnt, devc->dig_channel_mask,
++	       devc->ana_channel_cnt, devc->ana_channel_mask);
+ 
+ 	return SR_OK;
+ }
+@@ -1077,6 +1103,133 @@ static int configure_clocks(const struct sr_dev_inst *sdi)
+ 	return SR_OK;
+ }
+ 
++/*
++ * Load per-device analog calibration from Logic 2's .cal file.
++ * The file is JSON stored at ~/.config/Logic/calibrations/{serial}-*.cal
++ * and contains fullScaleVoltageRanges with per-channel min/max voltages.
++ * We parse minimumVoltage and maximumVoltage without a JSON library.
++ */
++SR_PRIV void saleae_logic_pro_load_calibration(const struct sr_dev_inst *sdi)
++{
++	struct dev_context *devc = sdi->priv;
++	const char *home;
++	GDir *dir;
++	const gchar *filename;
++	gchar *cal_dir, *cal_path, *contents;
++	gsize length;
++	uint64_t serial_id;
++	char serial_prefix[24];
++	const char *p;
++	unsigned int ch;
++
++	home = g_get_home_dir();
++	if (!home)
++		return;
++
++	cal_dir = g_build_filename(home, ".config", "Logic",
++				   "calibrations", NULL);
++	dir = g_dir_open(cal_dir, 0, NULL);
++	if (!dir) {
++		sr_dbg("No calibration directory: %s", cal_dir);
++		g_free(cal_dir);
++		return;
++	}
++
++	/* Construct the serial number as a uint64 (little-endian). */
++	serial_id = 0;
++	for (int i = 0; i < 8; i++)
++		serial_id |= (uint64_t)devc->eeprom_serial[i] << (i * 8);
++	snprintf(serial_prefix, sizeof(serial_prefix),
++		 "%" PRIu64 "-", serial_id);
++
++	/* Find a .cal file matching the serial. */
++	cal_path = NULL;
++	while ((filename = g_dir_read_name(dir)) != NULL) {
++		if (g_str_has_prefix(filename, serial_prefix) &&
++		    g_str_has_suffix(filename, ".cal")) {
++			cal_path = g_build_filename(cal_dir, filename, NULL);
++			break;
++		}
++	}
++	g_dir_close(dir);
++	g_free(cal_dir);
++
++	if (!cal_path) {
++		sr_dbg("No calibration file found for serial %" PRIu64 ".",
++		       serial_id);
++		return;
++	}
++
++	if (!g_file_get_contents(cal_path, &contents, &length, NULL)) {
++		sr_warn("Failed to read calibration file: %s", cal_path);
++		g_free(cal_path);
++		return;
++	}
++	sr_info("Loading calibration from %s", cal_path);
++	g_free(cal_path);
++
++	/*
++	 * Parse fullScaleVoltageRanges array. The format is:
++	 * "fullScaleVoltageRanges":[
++	 *   {"minimumVoltage":-0.498883,"maximumVoltage":5.237675},
++	 *   ...
++	 * ]
++	 */
++	p = strstr(contents, "\"fullScaleVoltageRanges\"");
++	if (!p) {
++		sr_warn("Calibration file missing fullScaleVoltageRanges.");
++		g_free(contents);
++		return;
++	}
++
++	p = strchr(p, '[');
++	if (!p) {
++		g_free(contents);
++		return;
++	}
++
++	for (ch = 0; ch < LOGIC8_MAX_ANA_CHANNELS && *p; ch++) {
++		const char *min_key, *max_key;
++		float vmin, vmax;
++
++		min_key = strstr(p, "\"minimumVoltage\"");
++		if (!min_key || min_key > strchr(p, ']'))
++			break;
++		min_key = strchr(min_key, ':');
++		if (!min_key)
++			break;
++		vmin = (float)g_ascii_strtod(min_key + 1, NULL);
++
++		max_key = strstr(min_key, "\"maximumVoltage\"");
++		if (!max_key)
++			break;
++		max_key = strchr(max_key, ':');
++		if (!max_key)
++			break;
++		vmax = (float)g_ascii_strtod(max_key + 1, NULL);
++
++		devc->ana_vmin[ch] = vmin;
++		devc->ana_vmax[ch] = vmax;
++
++		sr_dbg("CH%u calibration: %.4f V to %.4f V", ch, vmin, vmax);
++
++		/* Advance past this entry. */
++		p = strchr(max_key, '}');
++		if (!p)
++			break;
++		p++;
++	}
++
++	if (ch == LOGIC8_MAX_ANA_CHANNELS) {
++		devc->ana_calibrated = TRUE;
++		sr_info("Loaded calibration for %u analog channels.", ch);
++	} else {
++		sr_warn("Calibration incomplete: only %u channels.", ch);
++	}
++
++	g_free(contents);
++}
++
+ SR_PRIV int saleae_logic_pro_init(const struct sr_dev_inst *sdi)
+ {
+ 	struct dev_context *devc = sdi->priv;
+@@ -1117,6 +1270,7 @@ SR_PRIV int saleae_logic_pro_init(const struct sr_dev_inst *sdi)
+ 	ret = read_eeprom_serial(sdi, serial);
+ 	if (ret != SR_OK)
+ 		return ret;
++	memcpy(devc->eeprom_serial, serial, 8);
+ 
+ 	/* Check if we need to upload the bitstream. */
+ 	ret = read_reg(sdi, 0x7f, &reg_val);
+@@ -1310,6 +1464,7 @@ SR_PRIV int saleae_logic_pro_prepare(const struct sr_dev_inst *sdi)
+ 	struct sr_usb_dev_inst *usb = sdi->conn;
+ 	uint8_t start_req[] = {0x00, 0x01};
+ 	uint8_t start_rsp[2] = {};
++	int ret;
+ 
+ 	configure_channels(sdi);
+ 
+@@ -1343,13 +1498,13 @@ SR_PRIV int saleae_logic_pro_prepare(const struct sr_dev_inst *sdi)
+ 		 */
+ 		uint8_t regs_fx2[][2] = {
+ 			{0x00, 0x00},
+-			{0x08, 0x00}, /* No analog channels */
++			{0x08, 0x00}, /* Analog channel mask */
+ 			{0x06, 0xff}, /* Digital channel mask (all 8) */
+-			{0x0a, 0x00},
++			{0x0a, 0x00}, /* Analog sample rate */
+ 			{0x1b, 0x00},
+ 			{0x0b, 0x07}, /* Sample rate divisor */
+ 			{0x0c, 0x00},
+-			{0x0d, 0x00},
++			{0x0d, 0x00}, /* Analog mux rate */
+ 			{0x0e, 0x08}, /* Digital mux: 8 channels */
+ 			{0x13, 0x02}, /* Continuous streaming */
+ 			{0x14, 0x04}, /* Clock pre-divider */
+@@ -1359,52 +1514,112 @@ SR_PRIV int saleae_logic_pro_prepare(const struct sr_dev_inst *sdi)
+ 		regs_fx2[2][1] = devc->dig_channel_mask;
+ 		regs_fx2[8][1] = devc->dig_channel_cnt;
+ 
+-		/* Sample rate: 0x0b=divisor, 0x14=pre-divider. */
+-		switch (devc->dig_samplerate) {
+-		case SR_MHZ(1):
+-			regs_fx2[5][1] = 0xc7;
+-			regs_fx2[10][1] = 0x50;
+-			break;
+-		case SR_MHZ(4):
+-			regs_fx2[5][1] = 0x63;
+-			regs_fx2[10][1] = 0x28;
+-			break;
+-		case SR_MHZ(5):
+-			regs_fx2[5][1] = 0x31;
+-			regs_fx2[10][1] = 0x14;
+-			break;
+-		case SR_MHZ(8):
+-			regs_fx2[5][1] = 0x27;
+-			regs_fx2[10][1] = 0x10;
+-			break;
+-		case SR_MHZ(10):
+-			regs_fx2[5][1] = 0x18;
+-			regs_fx2[10][1] = 0x0a;
+-			break;
+-		case SR_MHZ(20):
+-			regs_fx2[5][1] = 0x13;
+-			regs_fx2[10][1] = 0x08;
+-			break;
+-		case SR_MHZ(25):
+-			regs_fx2[5][1] = 0x07;
+-			regs_fx2[10][1] = 0x04;
+-			break;
+-		case SR_MHZ(40):
+-			regs_fx2[5][1] = 0x04;
+-			regs_fx2[10][1] = 0x03;
+-			break;
+-		case SR_MHZ(50):
+-			regs_fx2[5][1] = 0x03;
+-			regs_fx2[10][1] = 0x03;
+-			break;
+-		case SR_MHZ(100):
+-			regs_fx2[5][1] = 0x03;
+-			regs_fx2[10][1] = 0x05;
+-			break;
+-		default:
+-			sr_warn("Logic 8: unsupported sample rate %" PRIu64 ".",
+-				devc->dig_samplerate);
+-			break;
++		/* Analog channel configuration. */
++		regs_fx2[1][1] = devc->ana_channel_mask;
++		regs_fx2[3][1] = devc->ana_channel_cnt > 0 ?
++				  devc->ana_channel_cnt : 0;
++		regs_fx2[7][1] = devc->ana_channel_cnt * 3; /* 0x0d */
++
++		if (devc->ana_channel_cnt > 0) {
++			/*
++			 * Analog mode: disable continuous streaming flag,
++			 * set analog-appropriate clock pre-divider.
++			 * Values from Logic 2 USB captures:
++			 *   1 ana ch: 0x0a=0x01 0x0d=0x03 0x14=0x06
++			 *   2 ana ch: 0x0a=0x01 0x0d=0x06 0x14=0x03
++			 *   8 ana ch: 0x0a=0x08 0x0d=0x18 0x14=0x03
++			 *   2a+2d:    0x0a=0x08 0x0d=0x06 0x0e=0x14 0x14=0x03
++			 * 0x13=0x00 in analog mode (not 0x02).
++			 */
++			regs_fx2[9][1] = 0x00; /* 0x13: no continuous flag */
++
++			if (devc->ana_channel_cnt == 1 &&
++			    devc->dig_channel_cnt == 0) {
++				regs_fx2[3][1] = 0x01; /* 0x0a */
++				regs_fx2[10][1] = 0x06; /* 0x14 */
++			} else {
++				regs_fx2[3][1] = 0x08; /* 0x0a */
++				regs_fx2[10][1] = 0x03; /* 0x14 */
++			}
++
++			/* 0x0b/0x0c = 0xff when no digital channels. */
++			if (devc->dig_channel_cnt == 0) {
++				regs_fx2[5][1] = 0xff; /* 0x0b */
++				regs_fx2[6][1] = 0xff; /* 0x0c */
++			}
++		} else {
++			regs_fx2[9][1] = 0x02; /* 0x13: continuous streaming */
++		}
++
++		/* Digital sample rate: 0x0b=divisor, 0x14=pre-divider. */
++		if (devc->dig_channel_cnt > 0) {
++			switch (devc->dig_samplerate) {
++			case SR_MHZ(1):
++				regs_fx2[5][1] = 0xc7;
++				if (devc->ana_channel_cnt == 0)
++					regs_fx2[10][1] = 0x50;
++				break;
++			case SR_MHZ(4):
++				regs_fx2[5][1] = 0x63;
++				if (devc->ana_channel_cnt == 0)
++					regs_fx2[10][1] = 0x28;
++				break;
++			case SR_MHZ(5):
++				regs_fx2[5][1] = 0x31;
++				if (devc->ana_channel_cnt == 0)
++					regs_fx2[10][1] = 0x14;
++				break;
++			case SR_MHZ(8):
++				regs_fx2[5][1] = 0x27;
++				if (devc->ana_channel_cnt == 0)
++					regs_fx2[10][1] = 0x10;
++				break;
++			case SR_MHZ(10):
++				regs_fx2[5][1] = 0x18;
++				if (devc->ana_channel_cnt == 0)
++					regs_fx2[10][1] = 0x0a;
++				break;
++			case SR_MHZ(20):
++				regs_fx2[5][1] = 0x13;
++				if (devc->ana_channel_cnt == 0)
++					regs_fx2[10][1] = 0x08;
++				break;
++			case SR_MHZ(25):
++				regs_fx2[5][1] = 0x07;
++				if (devc->ana_channel_cnt == 0)
++					regs_fx2[10][1] = 0x04;
++				break;
++			case SR_MHZ(40):
++				regs_fx2[5][1] = 0x04;
++				if (devc->ana_channel_cnt == 0)
++					regs_fx2[10][1] = 0x03;
++				break;
++			case SR_MHZ(50):
++				regs_fx2[5][1] = 0x03;
++				if (devc->ana_channel_cnt == 0)
++					regs_fx2[10][1] = 0x03;
++				break;
++			case SR_MHZ(100):
++				regs_fx2[5][1] = 0x03;
++				if (devc->ana_channel_cnt == 0)
++					regs_fx2[10][1] = 0x05;
++				break;
++			default:
++				sr_warn("Logic 8: unsupported sample rate %"
++					PRIu64 ".", devc->dig_samplerate);
++				break;
++			}
++		}
++
++		/*
++		 * Logic 2 reconfigures the PLL clocks before every
++		 * analog capture. Reuse the same clock config sequence
++		 * from init — the PLL values are the same.
++		 */
++		if (devc->ana_channel_cnt > 0) {
++			ret = configure_clocks(sdi);
++			if (ret != SR_OK)
++				return ret;
+ 		}
+ 
+ 		write_regs(sdi, ARRAY_AND_SIZE(regs_fx2));
+@@ -1498,6 +1713,16 @@ SR_PRIV int saleae_logic_pro_start(const struct sr_dev_inst *sdi)
+ 	devc->batch_index = 0;
+ 	devc->fx2_partial_len = 0;
+ 
++	/*
++	 * The SERDES needs time to lock after starting capture.
++	 * During settling, byte2 (the ADC sample) starts at an
++	 * arbitrary value unrelated to the input voltage.
++	 * Discard the first ~2 seconds of data (~128 transfers
++	 * at 16KB each = ~2MB).
++	 */
++	if (devc->ana_channel_cnt > 0)
++		devc->ana_skip_remaining = 128;
++
+ 	write_reg(sdi, 0x00, 0x01);
+ 
+ 	return SR_OK;
+@@ -1559,6 +1784,202 @@ static void saleae_logic_pro_send_data(const struct sr_dev_inst *sdi,
+ 	sr_session_send(sdi, &packet);
+ }
+ 
++static void saleae_logic_pro_send_analog(const struct sr_dev_inst *sdi,
++					  float *data, size_t num_samples,
++					  GSList *channels)
++{
++	struct sr_datafeed_packet packet;
++	struct sr_datafeed_analog analog;
++	struct sr_analog_encoding encoding;
++	struct sr_analog_meaning meaning;
++	struct sr_analog_spec spec;
++
++	sr_analog_init(&analog, &encoding, &meaning, &spec, 2);
++	analog.num_samples = num_samples;
++	analog.data = data;
++	analog.meaning->channels = channels;
++	analog.meaning->mq = SR_MQ_VOLTAGE;
++	analog.meaning->unit = SR_UNIT_VOLT;
++	analog.meaning->mqflags = 0;
++
++	packet.type = SR_DF_ANALOG;
++	packet.payload = &analog;
++	sr_session_send(sdi, &packet);
++}
++
++/*
++ * FX2 (Logic 8) analog data converter.
++ *
++ * The analog mux outputs frames of ana_channel_cnt * 3 * 2 bytes.
++ * Each channel produces 3-byte triplets, with byte 2 (bits 0-7 of
++ * the 24-bit value) containing the 8-bit ADC sample. Each channel
++ * appears twice per mux cycle (two time-interleaved samples).
++ *
++ * The raw 0-255 value maps linearly to a voltage range that is
++ * stored in per-device calibration data (ana_vmin/ana_vmax).
++ *
++ * Frame layout for N analog channels:
++ *   triplet 0: CH0 sample A (3 bytes, ADC in byte 2)
++ *   triplet 1: CH0 sample B
++ *   triplet 2: CH1 sample A
++ *   triplet 3: CH1 sample B
++ *   ...
++ *   triplet 2N-2: CHn sample A
++ *   triplet 2N-1: CHn sample B
++ */
++static void saleae_logic_pro_convert_analog_fx2(const struct sr_dev_inst *sdi,
++						const uint8_t *src, size_t len)
++{
++	struct dev_context *devc = sdi->priv;
++	unsigned int triplet_size, sample_idx;
++	float *dst;
++	struct sr_channel *ch;
++	float vmin, vmax, vrange;
++	unsigned int ana_idx;
++	const GSList *l;
++
++	/*
++	 * Each sample is a 3-byte triplet with the 8-bit ADC value
++	 * in byte 2. Adjacent triplets for the same channel are
++	 * duplicates; we output every triplet as a sample.
++	 *
++	 * With multiple analog channels, triplets are interleaved:
++	 * CH0, CH0, CH1, CH1, ..., CHn, CHn (repeating).
++	 * The mux cycle length is ana_channel_cnt * 3 * 2 bytes,
++	 * but since pairs are duplicates we step by 3 bytes per sample.
++	 */
++	triplet_size = 3;
++
++	/*
++	 * Find initial triplet alignment if not yet synced.
++	 * Byte 1 of each triplet has a fixed low nibble that
++	 * varies per channel but is constant within a channel.
++	 * We detect alignment by checking which offset gives
++	 * consistent low nibbles across several consecutive triplets.
++	 */
++	if (!devc->ana_synced && len >= 12) {
++		for (unsigned int align = 0; align < 3; align++) {
++			gboolean ok = TRUE;
++			uint8_t ref_nib = src[align + 1] & 0x0f;
++			for (unsigned int k = 1; k < 4; k++) {
++				unsigned int idx = align + k * 3 + 1;
++				if (idx >= len || (src[idx] & 0x0f) != ref_nib) {
++					ok = FALSE;
++					break;
++				}
++			}
++			if (ok) {
++				if (align > 0) {
++					src += align;
++					len -= align;
++					sr_dbg("Analog frame sync: skip %u bytes",
++					       align);
++				}
++				devc->ana_synced = TRUE;
++				break;
++			}
++		}
++		if (!devc->ana_synced)
++			return; /* Can't sync yet, discard. */
++	}
++
++	/* Handle partial triplet from previous transfer. */
++	if (devc->fx2_partial_len > 0) {
++		unsigned int needed = triplet_size - devc->fx2_partial_len;
++		if (len < needed) {
++			memcpy(devc->fx2_partial + devc->fx2_partial_len,
++			       src, len);
++			devc->fx2_partial_len += len;
++			return;
++		}
++		memcpy(devc->fx2_partial + devc->fx2_partial_len,
++		       src, needed);
++		src += needed;
++		len -= needed;
++		devc->fx2_partial_len = 0;
++	}
++
++	/*
++	 * For single-channel capture, all triplets are the same channel.
++	 * For multi-channel, triplets cycle through channels.
++	 * Send all samples for each channel in one packet.
++	 */
++	/*
++	 * Convert raw ADC values to voltages. The ADC uses offset-binary
++	 * encoding where raw 0 = vmin (~-0.5V) and raw 255 = vmax (~5.2V).
++	 * During input transients (e.g., fast voltage changes), the SERDES
++	 * may produce brief bursts of 0x00/0xFF values. We detect these
++	 * by checking if the raw value changes by more than half the ADC
++	 * range in a single sample, and hold the previous valid voltage.
++	 */
++	if (devc->ana_channel_cnt == 1) {
++		l = devc->ana_channel_list;
++		ch = l->data;
++		vmin = devc->ana_vmin[0];
++		vmax = devc->ana_vmax[0];
++		vrange = vmax - vmin;
++		dst = devc->ana_conv_buffer;
++		sample_idx = 0;
++
++		for (unsigned int pos = 2; pos < len; pos += triplet_size) {
++			dst[sample_idx++] = vmin +
++				(src[pos] / 255.0f) * vrange;
++		}
++
++		if (sample_idx > 0) {
++			GSList one_ch = { .data = ch, .next = NULL };
++			saleae_logic_pro_send_analog(sdi, dst, sample_idx,
++						     &one_ch);
++		}
++	} else {
++		unsigned int mux_cycle = devc->ana_channel_cnt * 6;
++
++		ana_idx = 0;
++		for (l = devc->ana_channel_list; l; l = l->next, ana_idx++) {
++			ch = l->data;
++			vmin = devc->ana_vmin[ana_idx];
++			vmax = devc->ana_vmax[ana_idx];
++			vrange = vmax - vmin;
++			dst = devc->ana_conv_buffer;
++			sample_idx = 0;
++
++			for (unsigned int pos = 0;
++			     pos + mux_cycle <= len;
++			     pos += mux_cycle) {
++				unsigned int off = pos + ana_idx * 6;
++				dst[sample_idx++] = vmin +
++					(src[off + 2] / 255.0f) * vrange;
++				dst[sample_idx++] = vmin +
++					(src[off + 5] / 255.0f) * vrange;
++			}
++
++			if (sample_idx > 0) {
++				GSList one_ch = { .data = ch, .next = NULL };
++				saleae_logic_pro_send_analog(sdi, dst,
++							     sample_idx,
++							     &one_ch);
++			}
++		}
++	}
++
++	/* Save leftover bytes. */
++	{
++		unsigned int consumed;
++		unsigned int leftover;
++
++		if (devc->ana_channel_cnt == 1)
++			consumed = (len / triplet_size) * triplet_size;
++		else
++			consumed = (len / (devc->ana_channel_cnt * 6)) *
++				   (devc->ana_channel_cnt * 6);
++		leftover = len - consumed;
++		if (leftover > 0) {
++			memcpy(devc->fx2_partial, src + consumed, leftover);
++			devc->fx2_partial_len = leftover;
++		}
++	}
++}
++
+ /*
+  * One batch from the device consists of 32 samples per active digital channel.
+  * This stream of batches is packed into USB packets with 16384 bytes each.
+@@ -1717,11 +2138,23 @@ SR_PRIV void LIBUSB_CALL saleae_logic_pro_receive_data(struct libusb_transfer *t
+ 	}
+ 
+ 	if (devc->is_fx2) {
+-		saleae_logic_pro_convert_fx2(sdi, transfer->buffer,
+-					     transfer->actual_length);
+-		if (devc->conv_size > 0)
+-			saleae_logic_pro_send_data(sdi, devc->conv_buffer,
+-						   devc->conv_size, 1);
++		if (devc->dig_channel_cnt > 0) {
++			saleae_logic_pro_convert_fx2(sdi, transfer->buffer,
++						     transfer->actual_length);
++			if (devc->conv_size > 0)
++				saleae_logic_pro_send_data(sdi,
++					devc->conv_buffer,
++					devc->conv_size, 1);
++		}
++		if (devc->ana_channel_cnt > 0) {
++			if (devc->ana_skip_remaining > 0) {
++				devc->ana_skip_remaining--;
++			} else {
++				saleae_logic_pro_convert_analog_fx2(sdi,
++					transfer->buffer,
++					transfer->actual_length);
++			}
++		}
+ 	} else {
+ 		saleae_logic_pro_convert_data(sdi, (uint32_t*)transfer->buffer,
+ 					      transfer->actual_length / 4);
+diff --git a/src/hardware/saleae-logic-pro/protocol.h b/src/hardware/saleae-logic-pro/protocol.h
+index 462dda53..818b45ba 100644
+--- a/src/hardware/saleae-logic-pro/protocol.h
++++ b/src/hardware/saleae-logic-pro/protocol.h
+@@ -36,12 +36,34 @@
+  */
+ #define CONV_BUFFER_SIZE (2 * 8 * 16384 + CONV_BATCH_SIZE)
+ 
++/*
++ * Analog frame: each channel produces 3-byte triplets.
++ * Byte 2 of each triplet is the 8-bit ADC sample.
++ * With N analog channels, the mux frame is N*3*2 bytes
++ * (N channels × 3 bytes × 2 copies per mux cycle).
++ * Max analog samples per USB transfer:
++ */
++#define ANA_CONV_BUFFER_SIZE (16384)
++
++#define LOGIC8_MAX_ANA_CHANNELS 8
++
+ struct dev_context {
+ 	unsigned int dig_channel_cnt;
+ 	uint16_t dig_channel_mask;
+ 	uint16_t dig_channel_masks[16];
+ 	uint64_t dig_samplerate;
+ 
++	unsigned int ana_channel_cnt;
++	uint8_t ana_channel_mask;
++	GSList *ana_channel_list;
++
++	/* Per-channel voltage calibration: voltage = vmin + (raw/255)*(vmax-vmin) */
++	float ana_vmin[LOGIC8_MAX_ANA_CHANNELS];
++	float ana_vmax[LOGIC8_MAX_ANA_CHANNELS];
++	gboolean ana_calibrated;
++
++	uint8_t eeprom_serial[8];
++
+ 	const char *fpga_bitstream;
+ 	unsigned int unit_size; /* 1 for <=8ch, 2 for <=16ch */
+ 	gboolean is_fx2;
+@@ -56,12 +78,18 @@ struct dev_context {
+ 	unsigned int conv_size;
+ 	unsigned int batch_index;
+ 
++	float *ana_conv_buffer;
++	unsigned int ana_conv_size;
++	unsigned int ana_skip_remaining; /* Transfers to discard for SERDES settling. */
++	gboolean ana_synced; /* TRUE once triplet frame alignment is found. */
++
+ 	/* FX2: partial frame carried across USB transfers. */
+-	uint8_t fx2_partial[16]; /* max frame = 8 channels × 2 bytes */
++	uint8_t fx2_partial[48]; /* max frame = 8 channels × 3 bytes × 2 */
+ 	unsigned int fx2_partial_len;
+ };
+ 
+ SR_PRIV int saleae_logic_pro_init(const struct sr_dev_inst *sdi);
++SR_PRIV void saleae_logic_pro_load_calibration(const struct sr_dev_inst *sdi);
+ SR_PRIV int saleae_logic_pro_prepare(const struct sr_dev_inst *sdi);
+ SR_PRIV int saleae_logic_pro_start(const struct sr_dev_inst *sdi);
+ SR_PRIV int saleae_logic_pro_stop(const struct sr_dev_inst *sdi);
