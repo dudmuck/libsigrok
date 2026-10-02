@@ -1381,6 +1381,31 @@ struct sr_serial_port {
 	char *description;
 };
 
+/** Sticky result of one Saleae Logic Pro/Logic 8 capture. Additive API v1.
+ * The caller must query before closing/destroying the device. `first_stage`
+ * points to a constant string owned by libsigrok. A non-Saleae driver returns
+ * SR_ERR_NA from sr_saleae_logic_pro_capture_status_get(). */
+struct sr_saleae_capture_status {
+	uint64_t transfers_completed;
+	uint64_t transfers_timed_out;
+	uint64_t transfers_cancelled;
+	uint64_t transfers_short;
+	uint64_t bytes_received;
+	uint64_t usb_errors;
+	uint64_t usb_no_device;
+	uint64_t usb_unexpected_cancel;
+	uint64_t usb_stall;
+	uint64_t usb_overflow;
+	uint64_t usb_partial_word;
+	uint64_t submit_errors;
+	uint64_t session_errors;
+	uint64_t stop_errors;
+	int first_code;
+	const char *first_stage;
+	int stop_requested;
+	int stop_completed;
+};
+
 #include <libsigrok/proto.h>
 #include <libsigrok/version.h>
 

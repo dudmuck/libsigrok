@@ -476,12 +476,16 @@ static int dev_acquisition_handle(int fd, int revents, void *cb_data)
 {
 	struct sr_dev_inst *sdi = cb_data;
 	struct drv_context *drvc = sdi->driver->context;
+	struct dev_context *devc = sdi->priv;
 	struct timeval tv = ALL_ZERO;
 
 	(void)fd;
 	(void)revents;
 
 	libusb_handle_events_timeout(drvc->sr_ctx->libusb_ctx, &tv);
+	/* Stop outside the libusb callback, after its transfer has been retired. */
+	if (devc->capture_failed && !devc->stop_requested)
+		sr_session_stop(sdi->session);
 
 	return TRUE;
 }
@@ -493,19 +497,30 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	struct libusb_transfer *transfer;
 	struct sr_usb_dev_inst *usb;
 	uint8_t *buf;
-	unsigned int i, ret;
+	unsigned int i;
+	int ret;
+	struct timeval tv = ALL_ZERO;
 
+	memset(&devc->capture_status, 0, sizeof(devc->capture_status));
+	devc->stop_requested = FALSE;
+	devc->capture_failed = FALSE;
 	ret = saleae_logic_pro_prepare(sdi);
-	if (ret != SR_OK)
+	if (ret != SR_OK) {
+		saleae_logic_pro_record_failure(devc, "device_prepare", ret);
 		return ret;
+	}
 
 	usb = sdi->conn;
 
 	devc->conv_buffer = g_malloc(CONV_BUFFER_SIZE);
 
 	ret = usb_source_add(sdi->session, drvc->sr_ctx, BUF_TIMEOUT, dev_acquisition_handle, (void *)sdi);
-	if (ret != SR_OK)
+	if (ret != SR_OK) {
+		saleae_logic_pro_record_failure(devc, "usb_source_add", ret);
+		g_free(devc->conv_buffer);
+		devc->conv_buffer = NULL;
 		return ret;
+	}
 
 	devc->num_transfers = BUF_COUNT;
 	devc->transfers = g_malloc0(sizeof(*devc->transfers) * BUF_COUNT);
@@ -520,20 +535,41 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 			       libusb_error_name(ret));
 			libusb_free_transfer(transfer);
 			g_free(buf);
-			dev_acquisition_abort(sdi);
-			return SR_ERR;
+			devc->capture_status.submit_errors++;
+			saleae_logic_pro_record_failure(devc, "usb_initial_submit", ret);
+			goto failed_after_transfers;
 		}
 		devc->transfers[i] = transfer;
 		devc->submitted_transfers++;
 	}
 
-	std_session_send_df_header(sdi);
-
-	saleae_logic_pro_start(sdi);
+	ret = std_session_send_df_header(sdi);
+	if (ret != SR_OK) {
+		devc->capture_status.session_errors++;
+		saleae_logic_pro_record_failure(devc, "session_header", ret);
+		goto failed_after_transfers;
+	}
+	ret = saleae_logic_pro_start(sdi);
 	if (ret != SR_OK)
-		return ret;
+		saleae_logic_pro_record_failure(devc, "device_start", ret);
+	if (ret != SR_OK)
+		goto failed_after_transfers;
 
 	return SR_OK;
+
+failed_after_transfers:
+	devc->stop_requested = TRUE;
+	devc->capture_status.stop_requested = 1;
+	dev_acquisition_abort(sdi);
+	while (devc->submitted_transfers > 0)
+		libusb_handle_events_timeout(drvc->sr_ctx->libusb_ctx, &tv);
+	g_free(devc->transfers);
+	devc->transfers = NULL;
+	devc->num_transfers = 0;
+	usb_source_remove(sdi->session, drvc->sr_ctx);
+	g_free(devc->conv_buffer);
+	devc->conv_buffer = NULL;
+	return SR_ERR;
 }
 
 static int dev_acquisition_stop(struct sr_dev_inst *sdi)
@@ -541,8 +577,16 @@ static int dev_acquisition_stop(struct sr_dev_inst *sdi)
 	struct dev_context *devc = sdi->priv;
 	struct drv_context *drvc = sdi->driver->context;
 	struct timeval tv = ALL_ZERO;
+	int ret, end_ret;
 
-	saleae_logic_pro_stop(sdi);
+	/* From this point LIBUSB_TRANSFER_CANCELLED is expected drain behavior. */
+	devc->stop_requested = TRUE;
+	devc->capture_status.stop_requested = 1;
+	ret = saleae_logic_pro_stop(sdi);
+	if (ret != SR_OK) {
+		devc->capture_status.stop_errors++;
+		saleae_logic_pro_record_failure(devc, "device_stop", ret);
+	}
 
 	/* Cancel all outstanding USB transfers. */
 	dev_acquisition_abort(sdi);
@@ -555,13 +599,34 @@ static int dev_acquisition_stop(struct sr_dev_inst *sdi)
 	devc->transfers = NULL;
 	devc->num_transfers = 0;
 
-	std_session_send_df_end(sdi);
+	end_ret = std_session_send_df_end(sdi);
+	if (end_ret != SR_OK) {
+		devc->capture_status.session_errors++;
+		saleae_logic_pro_record_failure(devc, "session_end", end_ret);
+	}
 
 	usb_source_remove(sdi->session, drvc->sr_ctx);
 
 	g_free(devc->conv_buffer);
 	devc->conv_buffer = NULL;
+	devc->capture_status.stop_completed = 1;
 
+	return devc->capture_failed ? SR_ERR : SR_OK;
+}
+
+SR_API int sr_saleae_logic_pro_capture_status_get(const struct sr_dev_inst *sdi,
+		struct sr_saleae_capture_status *status)
+{
+	struct dev_context *devc;
+
+	if (!sdi || !status)
+		return SR_ERR_ARG;
+	if (!sdi->driver || strcmp(sdi->driver->name, "saleae-logic-pro"))
+		return SR_ERR_NA;
+	devc = sdi->priv;
+	if (!devc)
+		return SR_ERR;
+	*status = devc->capture_status;
 	return SR_OK;
 }
 

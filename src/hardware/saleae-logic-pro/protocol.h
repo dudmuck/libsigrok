@@ -37,6 +37,10 @@
 #define CONV_BUFFER_SIZE (2 * 8 * 16384 + CONV_BATCH_SIZE)
 
 struct dev_context {
+	/* A failed capture stays failed through cancellation, drain and END. */
+	struct sr_saleae_capture_status capture_status;
+	gboolean stop_requested;
+	gboolean capture_failed;
 	unsigned int dig_channel_cnt;
 	uint16_t dig_channel_mask;
 	uint16_t dig_channel_masks[16];
@@ -60,6 +64,85 @@ struct dev_context {
 	uint8_t fx2_partial[16]; /* max frame = 8 channels × 2 bytes */
 	unsigned int fx2_partial_len;
 };
+
+static inline void saleae_logic_pro_record_failure(struct dev_context *devc,
+		const char *stage, int code)
+{
+	if (!devc->capture_failed) {
+		devc->capture_status.first_stage = stage;
+		devc->capture_status.first_code = code;
+	}
+	devc->capture_failed = TRUE;
+}
+
+/* Pure transfer accounting: exercised by offline fault-injection tests. A
+ * timeout carrying bytes is valid data; a cancellation is clean only after
+ * stop intent. Short USB packets are counted, not assumed to be data loss. */
+static inline gboolean saleae_logic_pro_account_transfer(struct dev_context *devc,
+		int status, int actual, int requested)
+{
+	if (actual < 0 || actual > requested) {
+		devc->capture_status.usb_errors++;
+		saleae_logic_pro_record_failure(devc, "usb_length", actual);
+		return FALSE;
+	}
+	switch (status) {
+	case LIBUSB_TRANSFER_COMPLETED:
+		devc->capture_status.transfers_completed++;
+		break;
+	case LIBUSB_TRANSFER_TIMED_OUT:
+		devc->capture_status.transfers_timed_out++;
+		break;
+	case LIBUSB_TRANSFER_CANCELLED:
+		devc->capture_status.transfers_cancelled++;
+		if (!devc->stop_requested) {
+			devc->capture_status.usb_errors++;
+			devc->capture_status.usb_unexpected_cancel++;
+			saleae_logic_pro_record_failure(devc, "usb_unexpected_cancel", status);
+		}
+		return FALSE;
+	case LIBUSB_TRANSFER_NO_DEVICE:
+		devc->capture_status.usb_errors++;
+		devc->capture_status.usb_no_device++;
+		saleae_logic_pro_record_failure(devc, "usb_no_device", status);
+		return FALSE;
+	default:
+		devc->capture_status.usb_errors++;
+		if (status == LIBUSB_TRANSFER_STALL)
+			devc->capture_status.usb_stall++;
+		if (status == LIBUSB_TRANSFER_OVERFLOW)
+			devc->capture_status.usb_overflow++;
+		saleae_logic_pro_record_failure(devc, "usb_transfer", status);
+		return FALSE;
+	}
+	if (actual > 0 && actual < requested)
+		devc->capture_status.transfers_short++;
+	devc->capture_status.bytes_received += actual;
+	if (!devc->is_fx2 && actual % 4 != 0) {
+		devc->capture_status.usb_errors++;
+		devc->capture_status.usb_partial_word++;
+		saleae_logic_pro_record_failure(devc, "usb_partial_word", actual);
+		return FALSE;
+	}
+	return TRUE;
+}
+
+/* The abort path owns only transfers still present in this array. Remove a
+ * completed callback's transfer before its storage is released. */
+static inline void saleae_logic_pro_retire_slot(struct dev_context *devc,
+		struct libusb_transfer *transfer)
+{
+	unsigned int i;
+	for (i = 0; i < devc->num_transfers; i++) {
+		if (devc->transfers[i] == transfer) {
+			devc->transfers[i] = NULL;
+			devc->submitted_transfers--;
+			return;
+		}
+	}
+	/* A callback for an unowned transfer is a capture-integrity failure. */
+	saleae_logic_pro_record_failure(devc, "usb_transfer_owner", SR_ERR);
+}
 
 SR_PRIV int saleae_logic_pro_init(const struct sr_dev_inst *sdi);
 SR_PRIV int saleae_logic_pro_prepare(const struct sr_dev_inst *sdi);

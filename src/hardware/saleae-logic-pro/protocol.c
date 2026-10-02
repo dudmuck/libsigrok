@@ -1498,9 +1498,7 @@ SR_PRIV int saleae_logic_pro_start(const struct sr_dev_inst *sdi)
 	devc->batch_index = 0;
 	devc->fx2_partial_len = 0;
 
-	write_reg(sdi, 0x00, 0x01);
-
-	return SR_OK;
+	return write_reg(sdi, 0x00, 0x01);
 }
 
 SR_PRIV int saleae_logic_pro_stop(const struct sr_dev_inst *sdi)
@@ -1512,19 +1510,25 @@ SR_PRIV int saleae_logic_pro_stop(const struct sr_dev_inst *sdi)
 	uint8_t status;
 	int ret;
 
-	write_reg(sdi, 0x00, 0x00);
+	ret = write_reg(sdi, 0x00, 0x00);
+	if (ret != SR_OK)
+		return ret;
 
 	if (devc->is_fx2) {
 		uint8_t stop_enc[2];
 		int xfer;
 
 		encrypt(sdi, stop_req, stop_enc, sizeof(stop_req));
-		libusb_bulk_transfer(usb->devhdl, 1,
+		ret = libusb_bulk_transfer(usb->devhdl, 1,
 				     stop_enc, sizeof(stop_enc),
 				     &xfer, 1000);
+		if (ret != LIBUSB_SUCCESS || xfer != (int)sizeof(stop_enc))
+			return SR_ERR;
 	} else {
-		transact(sdi, stop_req, sizeof(stop_req),
+		ret = transact(sdi, stop_req, sizeof(stop_req),
 			 stop_rsp, sizeof(stop_rsp));
+		if (ret != SR_OK)
+			return ret;
 	}
 
 	ret = read_reg(sdi, 0x40, &status);
@@ -1542,7 +1546,7 @@ SR_PRIV int saleae_logic_pro_stop(const struct sr_dev_inst *sdi)
 	return SR_OK;
 }
 
-static void saleae_logic_pro_send_data(const struct sr_dev_inst *sdi,
+static int saleae_logic_pro_send_data(const struct sr_dev_inst *sdi,
 				      void *data, size_t length, size_t unitsize)
 {
 	const struct sr_datafeed_logic logic = {
@@ -1556,7 +1560,7 @@ static void saleae_logic_pro_send_data(const struct sr_dev_inst *sdi,
 		.payload = &logic
 	};
 
-	sr_session_send(sdi, &packet);
+	return sr_session_send(sdi, &packet);
 }
 
 /*
@@ -1693,47 +1697,55 @@ SR_PRIV void LIBUSB_CALL saleae_logic_pro_receive_data(struct libusb_transfer *t
 	const struct sr_dev_inst *sdi = transfer->user_data;
 	struct dev_context *devc = sdi->priv;
 	int ret;
+	int delivered = SR_OK;
 
-	switch (transfer->status) {
-	case LIBUSB_TRANSFER_NO_DEVICE:
-		devc->submitted_transfers--;
-		g_free(transfer->buffer);
-		libusb_free_transfer(transfer);
-		return;
-	case LIBUSB_TRANSFER_COMPLETED:
-	case LIBUSB_TRANSFER_TIMED_OUT: /* We may have received some data though. */
-		break;
-	case LIBUSB_TRANSFER_CANCELLED:
-		devc->submitted_transfers--;
-		g_free(transfer->buffer);
-		libusb_free_transfer(transfer);
-		return;
-	default:
-		sr_dbg("USB transfer error: status %d", transfer->status);
-		devc->submitted_transfers--;
-		g_free(transfer->buffer);
-		libusb_free_transfer(transfer);
-		return;
+	if (!saleae_logic_pro_account_transfer(devc, transfer->status,
+			transfer->actual_length, transfer->length))
+		goto retire;
+	if (transfer->actual_length == 0) {
+		if (devc->stop_requested)
+			goto retire;
+		goto resubmit;
+	}
+	if (!devc->is_fx2 && transfer->actual_length % 4 != 0) {
+		devc->capture_status.usb_errors++;
+		saleae_logic_pro_record_failure(devc, "usb_partial_word", transfer->actual_length);
+		goto retire;
 	}
 
 	if (devc->is_fx2) {
 		saleae_logic_pro_convert_fx2(sdi, transfer->buffer,
 					     transfer->actual_length);
 		if (devc->conv_size > 0)
-			saleae_logic_pro_send_data(sdi, devc->conv_buffer,
+			delivered = saleae_logic_pro_send_data(sdi, devc->conv_buffer,
 						   devc->conv_size, 1);
 	} else {
 		saleae_logic_pro_convert_data(sdi, (uint32_t*)transfer->buffer,
 					      transfer->actual_length / 4);
-		saleae_logic_pro_send_data(sdi, devc->conv_buffer,
+		if (devc->conv_size > 0)
+			delivered = saleae_logic_pro_send_data(sdi, devc->conv_buffer,
 					   devc->conv_size, 2);
 	}
+	if (delivered != SR_OK) {
+		devc->capture_status.session_errors++;
+		saleae_logic_pro_record_failure(devc, "session_send", delivered);
+		goto retire;
+	}
+	if (devc->stop_requested || devc->capture_failed)
+		goto retire;
 
+resubmit:
 	if ((ret = libusb_submit_transfer(transfer)) != LIBUSB_SUCCESS) {
 		sr_err("Failed to resubmit transfer: %s.",
 		       libusb_error_name(ret));
-		devc->submitted_transfers--;
-		g_free(transfer->buffer);
-		libusb_free_transfer(transfer);
+		devc->capture_status.submit_errors++;
+		saleae_logic_pro_record_failure(devc, "usb_resubmit", ret);
+		goto retire;
 	}
+	return;
+
+retire:
+	saleae_logic_pro_retire_slot(devc, transfer);
+	g_free(transfer->buffer);
+	libusb_free_transfer(transfer);
 }

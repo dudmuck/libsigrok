@@ -832,6 +832,8 @@ mimeiconscalabledir = $(datadir)/icons/hicolor/scalable/mimetypes
 mimeiconscalable_DATA = contrib/libsigrok.svg
 
 EXTRA_DIST = \
+	tests/saleae_capture_loss_faults.c \
+	tests/saleae_callback_abort_asan.c \
 	Doxyfile \
 	HACKING \
 	README.devices \
@@ -1146,4 +1148,3 @@ dist-changelog:
 	else \
 		rm -f .ChangeLog.tmp; exit 1; \
 	fi
-

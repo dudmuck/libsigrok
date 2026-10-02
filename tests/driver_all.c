@@ -22,6 +22,63 @@
 #include <check.h>
 #include <libsigrok/libsigrok.h>
 #include "lib.h"
+#if HAVE_HW_SALEAE_LOGIC_PRO
+#include "../src/hardware/saleae-logic-pro/protocol.h"
+#endif
+
+#if HAVE_HW_SALEAE_LOGIC_PRO
+START_TEST(test_saleae_capture_transfer_faults_are_sticky)
+{
+	struct dev_context devc = {0};
+	struct sr_dev_inst *other;
+	struct sr_saleae_capture_status status;
+	int failures[] = {LIBUSB_TRANSFER_ERROR, LIBUSB_TRANSFER_STALL,
+		LIBUSB_TRANSFER_OVERFLOW, LIBUSB_TRANSFER_NO_DEVICE};
+	size_t i;
+
+	devc.is_fx2 = TRUE;
+	ck_assert(saleae_logic_pro_account_transfer(&devc,
+		LIBUSB_TRANSFER_COMPLETED, 128, 128));
+	ck_assert(saleae_logic_pro_account_transfer(&devc,
+		LIBUSB_TRANSFER_TIMED_OUT, 64, 128));
+	ck_assert_uint_eq(devc.capture_status.bytes_received, 192);
+	ck_assert_uint_eq(devc.capture_status.transfers_short, 1);
+	devc.stop_requested = TRUE;
+	ck_assert(!saleae_logic_pro_account_transfer(&devc,
+		LIBUSB_TRANSFER_CANCELLED, 0, 128));
+	ck_assert(!devc.capture_failed);
+	devc.stop_requested = FALSE;
+	ck_assert(!saleae_logic_pro_account_transfer(&devc,
+		LIBUSB_TRANSFER_CANCELLED, 0, 128));
+	ck_assert(devc.capture_failed);
+	ck_assert_str_eq(devc.capture_status.first_stage, "usb_unexpected_cancel");
+	for (i = 0; i < G_N_ELEMENTS(failures); i++)
+		ck_assert(!saleae_logic_pro_account_transfer(&devc, failures[i], 0, 128));
+	devc.stop_requested = TRUE;
+	ck_assert(!saleae_logic_pro_account_transfer(&devc,
+		LIBUSB_TRANSFER_CANCELLED, 0, 128));
+	ck_assert_str_eq(devc.capture_status.first_stage, "usb_unexpected_cancel");
+	ck_assert_uint_eq(devc.capture_status.usb_errors, 1 + G_N_ELEMENTS(failures));
+
+	other = sr_dev_inst_user_new("fixture", "other", "1");
+	ck_assert(other != NULL);
+	ck_assert_int_eq(sr_saleae_logic_pro_capture_status_get(other, &status), SR_ERR_NA);
+	ck_assert_int_eq(sr_saleae_logic_pro_capture_status_get(NULL, &status), SR_ERR_ARG);
+	/* No public standalone user-device destroy; the test process exits. */
+}
+END_TEST
+
+START_TEST(test_saleae_partial_word_fails)
+{
+	struct dev_context devc = {0};
+	devc.is_fx2 = FALSE;
+	ck_assert(!saleae_logic_pro_account_transfer(&devc,
+		LIBUSB_TRANSFER_COMPLETED, 3, 128));
+	ck_assert_str_eq(devc.capture_status.first_stage, "usb_partial_word");
+	ck_assert_uint_eq(devc.capture_status.usb_errors, 1);
+}
+END_TEST
+#endif
 
 /* Check whether at least one driver is available. */
 START_TEST(test_driver_available)
@@ -70,6 +127,10 @@ Suite *suite_driver_all(void)
 	tcase_add_checked_fixture(tc, srtest_setup, srtest_teardown);
 	tcase_add_test(tc, test_driver_available);
 	tcase_add_test(tc, test_driver_init_all);
+#if HAVE_HW_SALEAE_LOGIC_PRO
+	tcase_add_test(tc, test_saleae_capture_transfer_faults_are_sticky);
+	tcase_add_test(tc, test_saleae_partial_word_fails);
+#endif
 	// TODO: Currently broken.
 	// tcase_add_test(tc, test_config_get_set_samplerate);
 	suite_add_tcase(s, tc);
